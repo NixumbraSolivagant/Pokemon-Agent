@@ -386,6 +386,8 @@ def auto_iterate_args(args: argparse.Namespace) -> argparse.Namespace:
         base=args.base,
         out=args.out,
         promote=args.promote,
+        submission_out=args.submission_out,
+        strip_search_wrapper_for_submission=args.strip_search_wrapper_for_submission,
         generations=1,
         population=args.population,
         stage1_games=args.stage1_games,

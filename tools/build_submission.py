@@ -497,6 +497,12 @@ def agent(obs_dict: dict, configuration=None) -> list[int]:
         options = select.get("option") or []
         min_count = max(0, int(select.get("minCount", 0) or 0))
         return list(range(min(min_count, len(options))))
+
+
+# Kaggle executes the file and picks the last callable in insertion order.
+# Rebinding the existing agent under a new final name keeps the search helpers
+# private to our wrapper and prevents Kaggle from calling them directly.
+kaggle_agent = agent
 '''
 
 

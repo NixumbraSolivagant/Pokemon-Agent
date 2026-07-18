@@ -1682,3 +1682,8 @@ def agent(obs_dict: dict, configuration=None) -> list[int]:
         options = select.get("option") or []
         min_count = max(0, int(select.get("minCount", 0) or 0))
         return list(range(min(min_count, len(options))))
+
+
+# Kaggle executes main.py and picks the last callable in insertion order.
+# Keep the search helper functions from becoming the submitted callable.
+kaggle_agent = agent
