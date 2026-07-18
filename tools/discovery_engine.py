@@ -4,7 +4,9 @@ import argparse
 import json
 import os
 import shutil
+import tarfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -13,9 +15,10 @@ from local_eval.archive import sha256_file
 from local_eval.evaluator import run_ladder, save_report
 from local_eval.models import AgentStats, EvalConfig, MatchReport
 from tools.build_submission import BuildConfig, build_submission
+from tools.discovery_feedback import aggregate_feedback, write_pressure_artifacts
 from tools.discovery_space import generate_discovery_configs, read_build_metadata
 from tools.export_kaggle_submission import export_kaggle_submission
-from tools.loss_mining import mine_losses
+from tools.loss_mining import digest_loss_files, digest_scenarios, load_scenarios as load_loss_scenarios, mine_losses
 from tools.psro import psro_bonus_names, write_psro
 from tools.scenario_eval import run_scenarios
 
@@ -144,11 +147,48 @@ def resolve_workers(args: argparse.Namespace, profile: DiscoveryProfile) -> int:
     return workers
 
 
+def resolve_build_workers(args: argparse.Namespace, profile: DiscoveryProfile) -> int:
+    requested = getattr(args, "build_workers", None)
+    if requested is not None:
+        return max(1, requested)
+    return max(1, min(32, resolve_workers(args, profile)))
+
+
 def config_to_dict(cfg: BuildConfig) -> dict[str, Any]:
     data = asdict(cfg)
     data["base"] = str(cfg.base)
     data["out"] = str(cfg.out)
     return data
+
+
+def candidate_generation_summary(configs: list[BuildConfig], requested_population: int, records_built: int | None = None) -> dict[str, Any]:
+    origins: dict[str, int] = {}
+    families: dict[str, int] = {}
+    deck_overrides = 0
+    opponent_models: dict[str, int] = {}
+    policy_variants: dict[str, int] = {}
+    for cfg in configs:
+        origins[cfg.origin or "unknown"] = origins.get(cfg.origin or "unknown", 0) + 1
+        families[cfg.family or "unknown"] = families.get(cfg.family or "unknown", 0) + 1
+        opponent_models[cfg.opponent_model or "perfect"] = opponent_models.get(cfg.opponent_model or "perfect", 0) + 1
+        policy_variants[cfg.policy_variant or "default"] = policy_variants.get(cfg.policy_variant or "default", 0) + 1
+        if cfg.deck_override:
+            deck_overrides += 1
+    summary = {
+        "population_requested": requested_population,
+        "configs_generated": len(configs),
+        "records_built": records_built,
+        "underfilled": len(configs) < requested_population,
+        "underfill_ratio": (len(configs) / requested_population) if requested_population else 1.0,
+        "deck_overrides": deck_overrides,
+        "origin_counts": dict(sorted(origins.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "family_counts": dict(sorted(families.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "opponent_model_counts": dict(sorted(opponent_models.items(), key=lambda kv: (-kv[1], kv[0]))),
+        "policy_variant_counts": dict(sorted(policy_variants.items(), key=lambda kv: (-kv[1], kv[0]))[:24]),
+    }
+    if records_built is not None:
+        summary["build_success_rate"] = records_built / max(1, len(configs))
+    return summary
 
 
 def read_json(path: Path) -> dict[str, Any]:
@@ -235,13 +275,14 @@ def build_records(
     configs: list[BuildConfig],
     eval_dir: Path,
     strip_search_wrapper: bool,
+    build_workers: int = 1,
     progress: bool = False,
     progress_label: str = "build",
     progress_interval_s: float = 5.0,
     progress_mode: str = "auto",
     progress_file: Path | None = None,
+    failures_out: Path | None = None,
 ) -> list[CandidateRecord]:
-    records: list[CandidateRecord] = []
     eval_dir.mkdir(parents=True, exist_ok=True)
     total = len(configs)
     last_progress = 0.0
@@ -255,7 +296,8 @@ def build_records(
             mode=progress_mode,
             progress_file=progress_file,
         )
-    for index, cfg in enumerate(configs, start=1):
+
+    def build_one(index: int, cfg: BuildConfig) -> tuple[int, CandidateRecord | None, dict[str, Any] | None]:
         try:
             built = build_submission(cfg)
             eval_tarball = eval_dir / built.name
@@ -265,7 +307,8 @@ def build_records(
                 strip_search_wrapper=strip_search_wrapper,
                 exclude_internal_files=False,
             )
-            records.append(
+            return (
+                index,
                 CandidateRecord(
                     name=cfg.name,
                     family=cfg.family,
@@ -275,24 +318,67 @@ def build_records(
                     notes=cfg.notes,
                     sha256=sha256_file(built),
                     config=config_to_dict(cfg),
-                )
+                ),
+                None,
             )
         except Exception as exc:
-            print(json.dumps({"skipped": cfg.name, "reason": f"{type(exc).__name__}: {exc}"}))
-        now = time.monotonic()
-        if progress and (index == total or now - last_progress >= max(0.25, progress_interval_s)):
-            last_progress = now
-            _print_progress(
-                progress_label,
-                "build",
-                index,
-                total,
-                f"built={len(records)} last={cfg.name}",
-                mode=progress_mode,
-                force=index == total,
-                progress_file=progress_file,
-            )
-    return records
+            return index, None, {"skipped": cfg.name, "reason": f"{type(exc).__name__}: {exc}"}
+
+    records_by_index: dict[int, CandidateRecord] = {}
+    failures: list[dict[str, Any]] = []
+    completed = 0
+    workers = max(1, int(build_workers))
+    if workers > 1 and total > 1:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(build_one, index, cfg) for index, cfg in enumerate(configs, start=1)]
+            for future in as_completed(futures):
+                index, record, failure = future.result()
+                completed += 1
+                if record is not None:
+                    records_by_index[index] = record
+                if failure is not None:
+                    failures.append(failure)
+                    print(json.dumps(failure))
+                now = time.monotonic()
+                if progress and (completed == total or now - last_progress >= max(0.25, progress_interval_s)):
+                    last_progress = now
+                    name = configs[index - 1].name if 0 <= index - 1 < len(configs) else ""
+                    _print_progress(
+                        progress_label,
+                        "build",
+                        completed,
+                        total,
+                        f"built={len(records_by_index)} failed={len(failures)} last={name}",
+                        mode=progress_mode,
+                        force=completed == total,
+                        progress_file=progress_file,
+                    )
+    else:
+        for index, cfg in enumerate(configs, start=1):
+            _, record, failure = build_one(index, cfg)
+            completed += 1
+            if record is not None:
+                records_by_index[index] = record
+            if failure is not None:
+                failures.append(failure)
+                print(json.dumps(failure))
+            now = time.monotonic()
+            if progress and (index == total or now - last_progress >= max(0.25, progress_interval_s)):
+                last_progress = now
+                _print_progress(
+                    progress_label,
+                    "build",
+                    index,
+                    total,
+                    f"built={len(records_by_index)} failed={len(failures)} last={cfg.name}",
+                    mode=progress_mode,
+                    force=index == total,
+                    progress_file=progress_file,
+                )
+    if failures_out is not None:
+        failures_out.parent.mkdir(parents=True, exist_ok=True)
+        failures_out.write_text(json.dumps(failures, indent=2), encoding="utf-8")
+    return [records_by_index[index] for index in sorted(records_by_index)]
 
 
 def candidate_by_name(records: list[CandidateRecord]) -> dict[str, CandidateRecord]:
@@ -309,6 +395,342 @@ def score_delta(report: MatchReport, candidate: str, incumbent: str) -> tuple[fl
     inc = stats[incumbent]
     rec = cand.opponents.get(incumbent, {"wins": 0, "losses": 0, "draws": 0})
     return cand.kaggle_score_estimate - inc.kaggle_score_estimate, rec["wins"], rec["losses"]
+
+
+def no_result_rate(row: dict[str, Any]) -> float:
+    return float(row.get("no_results") or 0) / max(1.0, float(row.get("games") or 0))
+
+
+def inspect_submission(path: Path) -> dict[str, Any]:
+    required = {"main.py", "deck.csv", "cg/game.py", "cg/api.py"}
+    result = {
+        "path": str(path),
+        "exists": path.exists(),
+        "required_ok": False,
+        "missing": sorted(required),
+        "wrapper_count": 0,
+        "last_alias_ok": False,
+        "error": "",
+    }
+    if not path.exists():
+        result["error"] = "submission file does not exist"
+        return result
+    try:
+        with tarfile.open(path, "r:gz") as tar:
+            names = set(tar.getnames())
+            result["missing"] = sorted(required - names)
+            result["required_ok"] = not result["missing"]
+            payload = tar.extractfile("main.py")
+            main = payload.read().decode("utf-8") if payload else ""
+        marker = "# --- Champion Great Tusk search wrapper injected by tools.build_submission ---"
+        result["wrapper_count"] = main.count(marker)
+        search_idx = main.rfind("def _gt_search_action")
+        alias_idx = main.rfind("kaggle_agent = agent")
+        result["last_alias_ok"] = search_idx < 0 or alias_idx > search_idx
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def classify_final(
+    final: dict[str, Any],
+    submission_check: dict[str, Any] | None = None,
+    min_delta: float = 8.0,
+    max_no_result_rate: float = 0.01,
+    near_clean_no_result_rate: float = 0.02,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    status = str(final.get("status", ""))
+    delta = float(final.get("score_delta_vs_incumbent") or 0.0)
+    h2h_wins = int(final.get("h2h_wins") or 0)
+    h2h_losses = int(final.get("h2h_losses") or 0)
+    stage_rows = [row for row in final.get("stage_d_top", []) if isinstance(row, dict)]
+    best_row = next((row for row in stage_rows if row.get("name") == final.get("name") or row.get("name") == final.get("best")), {})
+    nr_rate = no_result_rate(best_row) if best_row else 0.0
+    package_ok = True
+    if submission_check is not None:
+        package_ok = bool(submission_check.get("required_ok")) and bool(submission_check.get("last_alias_ok")) and not submission_check.get("error")
+        if not package_ok:
+            reasons.append("submission package check failed")
+    if status == "failed":
+        return {"champion_class": "failed", "decision": "rerun_required", "submit_ready": False, "reasons": ["run failed", *reasons]}
+    if status != "promoted":
+        return {"champion_class": "portfolio_candidate", "decision": "hold_portfolio", "submit_ready": False, "reasons": ["not promoted", *reasons]}
+    if delta < min_delta:
+        reasons.append(f"score_delta {delta:.3f} below {min_delta:.3f}")
+    if h2h_wins < h2h_losses:
+        reasons.append(f"H2H losing vs incumbent: {h2h_wins}-{h2h_losses}")
+    if nr_rate > max_no_result_rate:
+        reasons.append(f"no_result_rate {nr_rate:.4f} above {max_no_result_rate:.4f}")
+    if nr_rate > max_no_result_rate and nr_rate <= near_clean_no_result_rate:
+        return {"champion_class": "unstable_candidate", "decision": "hold_portfolio", "submit_ready": False, "reasons": reasons}
+    if reasons:
+        return {"champion_class": "portfolio_candidate", "decision": "hold_portfolio", "submit_ready": False, "reasons": reasons}
+    if not package_ok:
+        return {"champion_class": "portfolio_candidate", "decision": "hold_portfolio", "submit_ready": False, "reasons": reasons}
+    return {"champion_class": "strict_champion", "decision": "submit_champion", "submit_ready": True, "reasons": ["strict champion gate passed"]}
+
+
+def write_decision_brief(out: Path, final: dict[str, Any], decision: dict[str, Any], submission_check: dict[str, Any] | None = None) -> None:
+    lines = [
+        "# Discovery Decision Brief",
+        "",
+        f"- decision: `{decision.get('decision')}`",
+        f"- champion_class: `{decision.get('champion_class')}`",
+        f"- submit_ready: `{decision.get('submit_ready')}`",
+        f"- status: `{final.get('status')}`",
+        f"- candidate: `{final.get('name') or final.get('best', '')}`",
+        f"- score_delta_vs_incumbent: `{final.get('score_delta_vs_incumbent')}`",
+        f"- h2h: `{final.get('h2h_wins', 0)}-{final.get('h2h_losses', 0)}`",
+        "",
+        "## Reasons",
+    ]
+    for reason in decision.get("reasons", []):
+        lines.append(f"- {reason}")
+    if submission_check is not None:
+        lines.extend(
+            [
+                "",
+                "## Submission Check",
+                f"- required_ok: `{submission_check.get('required_ok')}`",
+                f"- missing: `{submission_check.get('missing')}`",
+                f"- wrapper_count: `{submission_check.get('wrapper_count')}`",
+                f"- last_alias_ok: `{submission_check.get('last_alias_ok')}`",
+                f"- error: `{submission_check.get('error')}`",
+            ]
+        )
+    feedback = final.get("generation_feedback") or {}
+    if isinstance(feedback, dict):
+        lines.extend(
+            [
+                "",
+                "## Feedback Pressure",
+                f"- pressure_count: `{feedback.get('pressure_count')}`",
+                f"- top_kinds: `{feedback.get('top_kinds')}`",
+                f"- out: `{feedback.get('out')}`",
+            ]
+        )
+    microburst = final.get("microburst") or {}
+    if isinstance(microburst, dict):
+        lines.extend(
+            [
+                "",
+                "## Microburst",
+                f"- built: `{microburst.get('built')}`",
+                f"- selected: `{microburst.get('selected')}`",
+                f"- feedback: `{microburst.get('feedback')}`",
+            ]
+        )
+    generation = final.get("candidate_generation") or {}
+    if isinstance(generation, dict):
+        lines.extend(
+            [
+                "",
+                "## Candidate Generation",
+                f"- requested: `{generation.get('population_requested')}`",
+                f"- generated: `{generation.get('configs_generated')}`",
+                f"- built: `{generation.get('records_built')}`",
+                f"- underfilled: `{generation.get('underfilled')}`",
+                f"- origin_counts: `{generation.get('origin_counts')}`",
+            ]
+        )
+    lines.append("")
+    lines.append("## Stage D Top")
+    for row in final.get("stage_d_top", [])[:10]:
+        if not isinstance(row, dict):
+            continue
+        lines.append(
+            f"- `{row.get('name')}` score=`{row.get('kaggle_score_estimate')}` "
+            f"wl=`{row.get('wins')}-{row.get('losses')}` no_results=`{row.get('no_results')}`"
+        )
+    lines.append("")
+    lines.append("## Manual Candidates")
+    for row in final.get("manual_candidates", []):
+        if isinstance(row, dict):
+            lines.append(f"- `{row.get('name')}` role=`{row.get('role', row.get('origin', ''))}` path=`{row.get('tarball')}`")
+    out.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def set_run_phase(state: dict[str, Any], out: Path, generation: int, phase: str, detail: str = "") -> None:
+    state["active_generation"] = generation
+    state["active_phase"] = phase
+    state["active_detail"] = detail
+    state["updated_at"] = int(time.time())
+    write_json(out / "state.json", state)
+
+
+def latest_scenario_path(state: dict[str, Any]) -> Path | None:
+    for row in reversed(state.get("history", [])):
+        final = row.get("final") or {}
+        path = ((final.get("scenarios") or {}).get("out"))
+        if path and Path(path).exists() and Path(path).stat().st_size > 2:
+            return Path(path)
+    return None
+
+
+def scenario_path_if_useful(path: Path) -> Path | None:
+    if path.exists() and path.stat().st_size > 2:
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if isinstance(data, list) and data:
+            return path
+        if isinstance(data, dict) and data.get("scenarios"):
+            return path
+    return None
+
+
+def feedback_path_for_run(args: argparse.Namespace) -> Path | None:
+    if getattr(args, "feedback_mode", "closed_loop") == "off":
+        return None
+    explicit = getattr(args, "feedback_path", None)
+    if explicit:
+        return explicit
+    return args.out / "generation_feedback.json"
+
+
+def build_generation_feedback(
+    args: argparse.Namespace,
+    gen_dir: Path,
+    generation: int,
+    incumbent_name: str,
+    population: int,
+    stage_names: list[str],
+    scenario_paths: list[Path],
+    out: Path,
+    microburst: bool = False,
+    previous_feedback: Path | None = None,
+) -> dict[str, Any]:
+    if getattr(args, "feedback_mode", "closed_loop") == "off":
+        return {"version": 2, "generation": generation, "mode": "off", "pressure_items": []}
+    audit_only_holdout = getattr(args, "holdout_feedback_mode", "audit_only") == "audit_only"
+    reports = {
+        stage: gen_dir / stage / "report.json"
+        for stage in stage_names
+        if (gen_dir / stage / "report.json").exists() and not (audit_only_holdout and "holdout" in stage)
+    }
+    psro_paths = [
+        gen_dir / stage / "psro.json"
+        for stage in stage_names
+        if (gen_dir / stage / "psro.json").exists() and not (audit_only_holdout and "holdout" in stage)
+    ]
+    scenario_inputs = [
+        path
+        for path in scenario_paths
+        if path.exists() and not (audit_only_holdout and path.name == "scenarios.json")
+    ]
+    feedback = aggregate_feedback(
+        out=out,
+        generation=generation,
+        stage_reports=reports,
+        scenario_paths=scenario_inputs,
+        psro_paths=psro_paths,
+        build_failures=gen_dir / "build_failures.json",
+        incumbent_name=incumbent_name,
+        population=population,
+        holdout_feedback_mode=getattr(args, "holdout_feedback_mode", "audit_only"),
+        microburst=microburst,
+        previous_feedback=previous_feedback,
+    )
+    write_pressure_artifacts(out.parent, feedback)
+    return feedback
+
+
+def write_pool_manifest(out: Path, incumbent: Path, core_pool: list[Path], hof_paths: list[Path], holdout_count: int) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = [{"role": "incumbent", "path": str(incumbent)}]
+    seen = {str(incumbent)}
+    holdout_slots = min(max(1, len(core_pool) // 3), max(0, holdout_count), len(core_pool))
+    holdout_paths = {str(path) for path in core_pool[-holdout_slots:]} if holdout_slots else set()
+    for path in core_pool:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        role = "holdout" if key in holdout_paths else "core"
+        entries.append({"role": role, "path": key})
+    for path in hof_paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append({"role": "hof", "path": key})
+    manifest = {
+        "version": 1,
+        "policy": "generation may use incumbent/core/hof; holdout is audit signal and is not used for card-level mutation.",
+        "entries": entries,
+        "role_counts": {
+            role: sum(1 for entry in entries if entry.get("role") == role)
+            for role in sorted({str(entry.get("role")) for entry in entries})
+        },
+    }
+    write_json(out, manifest)
+    return manifest
+
+
+def pool_paths_by_role(manifest: dict[str, Any]) -> dict[str, list[Path]]:
+    roles: dict[str, list[Path]] = {}
+    for entry in manifest.get("entries", []):
+        if not isinstance(entry, dict):
+            continue
+        role = str(entry.get("role") or "core")
+        path = Path(str(entry.get("path") or ""))
+        if path.exists():
+            roles.setdefault(role, []).append(path)
+    return roles
+
+
+def run_scenario_gate(
+    records: list[CandidateRecord],
+    names: list[str],
+    scenario_path: Path | None,
+    opponent: Path,
+    out: Path,
+    args: argparse.Namespace,
+    incumbent_name: str,
+) -> tuple[list[str], dict[str, Any]]:
+    if not getattr(args, "scenario_gate", True) or scenario_path is None or not scenario_path.exists():
+        return names, {"status": "skipped", "reason": "no scenario input"}
+    by_name = candidate_by_name(records)
+    selected = [name for name in names[: max(1, args.scenario_gate_candidates)] if name in by_name]
+    if incumbent_name in by_name and incumbent_name not in selected:
+        selected = [incumbent_name, *selected]
+    candidate_paths = [Path(by_name[name].eval_tarball) for name in selected]
+    if not candidate_paths:
+        return names, {"status": "skipped", "reason": "no selected candidates"}
+    rows = run_scenarios(
+        scenario_path,
+        candidate_paths,
+        opponent,
+        out / "scenario_gate.json",
+        limit=args.scenario_gate_limit,
+        takeover_actions=args.scenario_takeover_actions,
+        seed=args.seed + 909,
+    )
+    by_candidate: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        data = row.to_dict()
+        by_candidate.setdefault(data["candidate"], []).append(data)
+    summary: dict[str, Any] = {"status": "ok", "scenario_path": str(scenario_path), "candidates": {}}
+    incumbent_delta = 0.0
+    for name, items in by_candidate.items():
+        reached = [item for item in items if item.get("reached")]
+        reach_rate = len(reached) / max(1, len(items))
+        avg_delta = sum(float(item.get("delta") or 0.0) for item in reached) / max(1, len(reached))
+        summary["candidates"][name] = {"rows": len(items), "reach_rate": reach_rate, "avg_delta": avg_delta}
+        if name == incumbent_name:
+            incumbent_delta = avg_delta
+    penalized = {
+        name
+        for name, item in summary["candidates"].items()
+        if name != incumbent_name
+        and item["reach_rate"] >= 0.60
+        and item["avg_delta"] < incumbent_delta - args.scenario_penalty_margin
+    }
+    adjusted = [name for name in names if name not in penalized] + [name for name in names if name in penalized]
+    summary["penalized"] = sorted(penalized)
+    (out / "scenario_gate_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return adjusted, summary
 
 
 def select_next_names(
@@ -459,44 +881,191 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
     variants_dir = gen_dir / "variants"
     incumbent_tarball = incumbent_path_from_state(state, args.incumbent)
     hof_paths = hof_paths_from_state(state)
+    digest_path = args.loss_digest if args.loss_digest else args.out / "loss_digest.json"
+    feedback_path = feedback_path_for_run(args)
+    requested_population = args.population or profile.population
+    set_run_phase(state, args.out, generation, "build", "generating candidate configs")
     configs = generate_discovery_configs(
         incumbent_tarball=incumbent_tarball,
         out_dir=variants_dir,
-        population=args.population or profile.population,
+        population=requested_population,
         generation=generation,
         seed=args.seed,
         hof_paths=hof_paths,
         include_portfolio=args.include_portfolio,
+        loss_digest_path=digest_path if digest_path.exists() else None,
+        feedback_path=feedback_path if feedback_path and feedback_path.exists() else None,
+        min_diversity_distance=args.min_diversity_distance,
     )
+    generation_summary = candidate_generation_summary(configs, requested_population)
+    write_json(gen_dir / "candidate_generation.json", generation_summary)
+    if generation_summary["underfilled"]:
+        print(
+            json.dumps(
+                {
+                    "warning": "candidate_population_underfilled",
+                    "generation": generation,
+                    "population_requested": requested_population,
+                    "configs_generated": len(configs),
+                    "underfill_ratio": generation_summary["underfill_ratio"],
+                }
+            ),
+            flush=True,
+        )
     records = build_records(
         configs,
         gen_dir / "eval_variants",
         args.strip_search_wrapper,
+        build_workers=resolve_build_workers(args, profile),
         progress=args.progress,
         progress_label=f"generation_{generation:03d}",
         progress_interval_s=args.progress_interval,
         progress_mode=args.progress_mode,
         progress_file=gen_dir / "progress.txt",
+        failures_out=gen_dir / "build_failures.json",
     )
     if not records:
         raise RuntimeError("No candidates built")
+    generation_summary = candidate_generation_summary(configs, requested_population, len(records))
+    write_json(gen_dir / "candidate_generation.json", generation_summary)
     incumbent_name = f"d{generation:03d}_incumbent"
     all_names = [record.name for record in records]
-    pool = unique_existing([*args.pool, *hof_paths])
+    pool_manifest = write_pool_manifest(gen_dir / "pool_manifest.json", incumbent_tarball, unique_existing(args.pool), hof_paths, profile.stage_d.pool_limit)
+    pools = pool_paths_by_role(pool_manifest)
+    discovery_pool = unique_existing([*pools.get("core", []), *pools.get("hof", [])])
+    holdout_pool = unique_existing([*pools.get("holdout", []), *pools.get("core", []), *pools.get("hof", [])])
 
-    report_a, names_a = eval_stage(records, all_names, pool, gen_dir, profile.stage_a, profile, args, generation * 10000 + 101, incumbent_name)
+    set_run_phase(state, args.out, generation, profile.stage_a.name, "running Stage A ladder")
+    report_a, names_a = eval_stage(records, all_names, discovery_pool, gen_dir, profile.stage_a, profile, args, generation * 10000 + 101, incumbent_name)
     state["stage_a_top"] = names_a
     write_json(args.out / "state.json", state)
 
-    report_b, names_b = eval_stage(records, names_a, pool, gen_dir, profile.stage_b, profile, args, generation * 10000 + 202, incumbent_name)
+    set_run_phase(state, args.out, generation, profile.stage_b.name, "running Stage B ladder")
+    report_b, names_b = eval_stage(records, names_a, discovery_pool, gen_dir, profile.stage_b, profile, args, generation * 10000 + 202, incumbent_name)
+    stage_b_scenarios = gen_dir / "stage_b_scenarios.json"
+    mine_losses(
+        [gen_dir / profile.stage_b.name / "game_records"],
+        stage_b_scenarios,
+        focus="",
+        limit=max(8, args.scenario_limit // 2),
+        max_prefix_actions=args.scenario_max_prefix_actions,
+        max_trigger_turn=args.scenario_max_trigger_turn,
+        min_drop=args.scenario_min_drop,
+    )
+    microburst_feedback_path = gen_dir / "microburst" / "generation_feedback.json"
+    microburst_feedback = build_generation_feedback(
+        args,
+        gen_dir,
+        generation,
+        incumbent_name,
+        min(args.microburst_max, max(16, int((args.population or profile.population) * args.microburst_fraction))),
+        [profile.stage_a.name, profile.stage_b.name],
+        [stage_b_scenarios],
+        microburst_feedback_path,
+        microburst=True,
+        previous_feedback=feedback_path if feedback_path and feedback_path.exists() else None,
+    )
+    microburst_records: list[CandidateRecord] = []
+    microburst_names: list[str] = []
+    if (
+        getattr(args, "feedback_mode", "closed_loop") == "closed_loop"
+        and microburst_feedback.get("pressure_items")
+        and args.microburst_fraction > 0
+    ):
+        set_run_phase(state, args.out, generation, "microburst_build", "building pressure-directed Stage B repair candidates")
+        micro_generation = generation * 1000 + 501
+        micro_population = min(args.microburst_max, max(16, int((args.population or profile.population) * args.microburst_fraction)))
+        micro_configs = generate_discovery_configs(
+            incumbent_tarball=incumbent_tarball,
+            out_dir=gen_dir / "microburst" / "variants",
+            population=micro_population,
+            generation=micro_generation,
+            seed=args.seed + 1701,
+            hof_paths=hof_paths,
+            include_portfolio=False,
+            feedback_path=microburst_feedback_path,
+            pressure_only=True,
+            min_diversity_distance=args.min_diversity_distance,
+        )
+        microburst_records = build_records(
+            micro_configs,
+            gen_dir / "microburst" / "eval_variants",
+            args.strip_search_wrapper,
+            build_workers=resolve_build_workers(args, profile),
+            progress=args.progress,
+            progress_label=f"generation_{generation:03d}_microburst",
+            progress_interval_s=args.progress_interval,
+            progress_mode=args.progress_mode,
+            progress_file=gen_dir / "microburst" / "progress.txt",
+            failures_out=gen_dir / "microburst" / "build_failures.json",
+        )
+        if microburst_records:
+            micro_incumbent = f"d{micro_generation:03d}_incumbent"
+            micro_stage = Stage(
+                "stage_b_microburst",
+                max(1, profile.stage_b.games_per_pair // 2),
+                min(len(microburst_records), max(4, args.microburst_max)),
+                profile.stage_b.pool_limit,
+                "sample",
+                min(profile.stage_b.finalists, max(2, len(microburst_records) // 3)),
+            )
+            set_run_phase(state, args.out, generation, micro_stage.name, "running microburst Stage B ladder")
+            _, micro_names = eval_stage(
+                microburst_records,
+                [record.name for record in microburst_records],
+                discovery_pool,
+                gen_dir / "microburst",
+                micro_stage,
+                profile,
+                args,
+                generation * 10000 + 252,
+                micro_incumbent,
+            )
+            microburst_names = [name for name in micro_names if name != micro_incumbent]
+            records.extend([record for record in microburst_records if record.name != micro_incumbent])
+            names_b = [*names_b, *[name for name in microburst_names if name not in names_b]]
+    names_b, scenario_gate = run_scenario_gate(
+        records,
+        names_b,
+        scenario_path_if_useful(stage_b_scenarios) or latest_scenario_path(state),
+        incumbent_tarball,
+        gen_dir,
+        args,
+        incumbent_name,
+    )
     state["stage_b_top"] = names_b
+    state["scenario_gate"] = scenario_gate
+    state["microburst"] = {"built": len(microburst_records), "selected": microburst_names[:12], "feedback": str(microburst_feedback_path)}
     write_json(args.out / "state.json", state)
 
-    report_c, names_c = eval_stage(records, names_b, pool, gen_dir, profile.stage_c, profile, args, generation * 10000 + 303, incumbent_name)
+    set_run_phase(state, args.out, generation, profile.stage_c.name, "running Stage C confirmation")
+    report_c, names_c = eval_stage(records, names_b, discovery_pool, gen_dir, profile.stage_c, profile, args, generation * 10000 + 303, incumbent_name)
+    stage_c_scenarios = gen_dir / "stage_c_scenarios.json"
+    mine_losses(
+        [gen_dir / profile.stage_c.name / "game_records"],
+        stage_c_scenarios,
+        focus="",
+        limit=args.scenario_limit,
+        max_prefix_actions=args.scenario_max_prefix_actions,
+        max_trigger_turn=args.scenario_max_trigger_turn,
+        min_drop=args.scenario_min_drop,
+    )
+    names_c, stage_c_scenario_gate = run_scenario_gate(
+        records,
+        names_c,
+        scenario_path_if_useful(stage_c_scenarios),
+        incumbent_tarball,
+        gen_dir / "stage_c_scenario_gate",
+        args,
+        incumbent_name,
+    )
     state["stage_c_top"] = names_c
+    state["stage_c_scenario_gate"] = stage_c_scenario_gate
     write_json(args.out / "state.json", state)
 
-    report_d, names_d = eval_stage(records, names_c, pool, gen_dir, profile.stage_d, profile, args, generation * 10000 + 404, incumbent_name)
+    set_run_phase(state, args.out, generation, profile.stage_d.name, "running Stage D holdout")
+    report_d, names_d = eval_stage(records, names_c, holdout_pool, gen_dir, profile.stage_d, profile, args, generation * 10000 + 404, incumbent_name)
+    set_run_phase(state, args.out, generation, "finalize", "classifying holdout result")
     stats = stats_by_name(report_d)
     by_name = candidate_by_name(records)
     clean_names = [name for name in names_d if name in stats and clean_stats(stats[name], profile.max_no_result_rate)]
@@ -513,13 +1082,21 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
         strict_ok = best_name != incumbent_name and (
             incumbent_name not in stats
             or (delta >= args.min_holdout_score_delta if args.min_holdout_score_delta is not None else profile.min_holdout_score_delta)
-        )
+        ) and (incumbent_name not in stats or h2h_wins >= h2h_losses)
         manual_names = [name for name in clean_names if name != incumbent_name]
         if strict_ok:
             final = export_candidate(by_name[best_name], args.promote, args.submission_out, args.strip_search_wrapper)
             final.update({"status": "promoted", "score_delta_vs_incumbent": delta, "h2h_wins": h2h_wins, "h2h_losses": h2h_losses})
             state["incumbent"] = final["promote"]
         else:
+            gate_reasons = []
+            threshold = args.min_holdout_score_delta if args.min_holdout_score_delta is not None else profile.min_holdout_score_delta
+            if best_name == incumbent_name:
+                gate_reasons.append("best candidate is the incumbent")
+            if incumbent_name in stats and delta < threshold:
+                gate_reasons.append("score_delta below threshold")
+            if incumbent_name in stats and h2h_wins < h2h_losses:
+                gate_reasons.append(f"H2H losing vs incumbent: {h2h_wins}-{h2h_losses}")
             final = {
                 "status": "held",
                 "reason": "best holdout candidate did not clear strict incumbent gate",
@@ -528,6 +1105,7 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
                 "h2h_wins": h2h_wins,
                 "h2h_losses": h2h_losses,
                 "incumbent": str(incumbent_tarball),
+                "gate_reasons": gate_reasons,
             }
         final["manual_candidates"] = export_manual(
             records,
@@ -544,8 +1122,48 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
 
     record_dirs = [gen_dir / profile.stage_c.name / "game_records", gen_dir / profile.stage_d.name / "game_records"]
     scenario_out = gen_dir / "scenarios.json"
-    scenarios = mine_losses(record_dirs, scenario_out, focus="", limit=args.scenario_limit)
+    scenarios = mine_losses(
+        record_dirs,
+        scenario_out,
+        focus="",
+        limit=args.scenario_limit,
+        max_prefix_actions=args.scenario_max_prefix_actions,
+        max_trigger_turn=args.scenario_max_trigger_turn,
+        min_drop=args.scenario_min_drop,
+    )
+    loss_digest = digest_scenarios([scenario.to_dict() for scenario in scenarios], gen_dir / "loss_digest.json")
+    training_scenarios = [*load_loss_scenarios(stage_b_scenarios), *load_loss_scenarios(stage_c_scenarios)]
+    if getattr(args, "holdout_feedback_mode", "audit_only") == "weak_signal":
+        training_scenarios.extend(scenario.to_dict() for scenario in scenarios)
+    digest_scenarios(training_scenarios, args.out / "loss_digest.json")
+    next_feedback_path = gen_dir / "generation_feedback.json"
+    generation_feedback = build_generation_feedback(
+        args,
+        gen_dir,
+        generation,
+        incumbent_name,
+        args.population or profile.population,
+        [profile.stage_a.name, profile.stage_b.name, profile.stage_c.name, profile.stage_d.name],
+        [stage_b_scenarios, stage_c_scenarios, scenario_out],
+        next_feedback_path,
+        microburst=False,
+        previous_feedback=feedback_path if feedback_path and feedback_path.exists() else None,
+    )
+    if feedback_path is not None:
+        write_json(feedback_path, generation_feedback)
     final["scenarios"] = {"out": str(scenario_out), "count": len(scenarios)}
+    final["loss_digest"] = {"out": str(gen_dir / "loss_digest.json"), **loss_digest}
+    final["generation_feedback"] = {
+        "out": str(next_feedback_path),
+        "root": str(feedback_path) if feedback_path is not None else "",
+        "pressure_count": len(generation_feedback.get("pressure_items", [])),
+        "top_kinds": (generation_feedback.get("summary") or {}).get("top_kinds", {}),
+    }
+    final["scenario_gate"] = scenario_gate
+    final["stage_c_scenario_gate"] = stage_c_scenario_gate
+    final["microburst"] = state.get("microburst", {})
+    final["pool_manifest"] = {"out": str(gen_dir / "pool_manifest.json"), "role_counts": pool_manifest.get("role_counts", {})}
+    final["candidate_generation"] = {**generation_summary, "out": str(gen_dir / "candidate_generation.json")}
     final["reports"] = {
         "stage_a": str(gen_dir / profile.stage_a.name / "report.json"),
         "stage_b": str(gen_dir / profile.stage_b.name / "report.json"),
@@ -553,6 +1171,18 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
         "stage_d": str(gen_dir / profile.stage_d.name / "report.json"),
     }
     final["records"] = [asdict(record) for record in records]
+    submission_check = inspect_submission(args.submission_out) if Path(args.submission_out).exists() else None
+    decision = classify_final(
+        final,
+        submission_check,
+        min_delta=args.min_holdout_score_delta if args.min_holdout_score_delta is not None else profile.min_holdout_score_delta,
+        max_no_result_rate=profile.max_no_result_rate,
+        near_clean_no_result_rate=args.near_clean_no_result_rate,
+    )
+    final.update(decision)
+    write_json(gen_dir / "decision.json", {"final": final, "submission_check": submission_check, "decision": decision})
+    write_decision_brief(gen_dir / "decision_brief.md", final, decision, submission_check)
+    write_decision_brief(args.out / "decision_brief.md", final, decision, submission_check)
     state["generation"] = generation
     state["final"] = final
     state.setdefault("history", []).append({"generation": generation, "final": final})
@@ -568,6 +1198,7 @@ def run_engine(args: argparse.Namespace) -> dict[str, Any]:
     state = read_json(state_path) if args.resume else {}
     state.setdefault("profile", asdict(profile))
     state["effective_workers"] = resolve_workers(args, profile)
+    state["effective_build_workers"] = resolve_build_workers(args, profile)
     state.setdefault("incumbent", str(args.incumbent))
     generations = args.generations if args.generations is not None else profile.generations
     start = int(state.get("generation", 0)) + 1
@@ -583,13 +1214,60 @@ def status(args: argparse.Namespace) -> dict[str, Any]:
     return {
         "out": str(args.out),
         "generation": state.get("generation"),
+        "active_generation": state.get("active_generation"),
+        "active_phase": state.get("active_phase"),
+        "active_detail": state.get("active_detail"),
         "incumbent": state.get("incumbent"),
         "effective_workers": state.get("effective_workers"),
+        "effective_build_workers": state.get("effective_build_workers"),
+        "scenario_gate": state.get("scenario_gate"),
+        "stage_c_scenario_gate": state.get("stage_c_scenario_gate"),
+        "microburst": state.get("microburst"),
         "stage_a_top": state.get("stage_a_top", [])[:8],
         "stage_b_top": state.get("stage_b_top", [])[:8],
         "stage_c_top": state.get("stage_c_top", [])[:8],
         "final": final,
     }
+
+
+def audit(args: argparse.Namespace) -> dict[str, Any]:
+    final = read_json(args.out / "final_report.json")
+    submission_path = args.submission or Path(final.get("submission") or "")
+    submission_check = inspect_submission(submission_path) if submission_path else None
+    decision = classify_final(
+        final,
+        submission_check,
+        min_delta=args.min_holdout_score_delta,
+        max_no_result_rate=args.max_no_result_rate,
+        near_clean_no_result_rate=args.near_clean_no_result_rate,
+    )
+    result = {
+        "out": str(args.out),
+        "submission": str(submission_path),
+        "decision": decision,
+        "submission_check": submission_check,
+        "final": {
+            key: final.get(key)
+            for key in (
+                "status",
+                "name",
+                "best",
+                "score_delta_vs_incumbent",
+                "h2h_wins",
+                "h2h_losses",
+                "manual_candidates",
+            )
+        },
+    }
+    write_json(args.out / "decision.json", result)
+    write_decision_brief(args.out / "decision_brief.md", final, decision, submission_check)
+    return result
+
+
+def digest_losses_command(args: argparse.Namespace) -> dict[str, Any]:
+    scenario_paths = list(args.out.glob("generation_*/scenarios.json"))
+    digest = digest_loss_files(scenario_paths, args.out / "loss_digest.json")
+    return {"out": str(args.out / "loss_digest.json"), **digest}
 
 
 def export_final(args: argparse.Namespace) -> dict[str, Any]:
@@ -612,6 +1290,7 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--generations", type=int)
     parser.add_argument("--population", type=int)
     parser.add_argument("--workers", type=int, help="Concurrent games. Use 0 for os.cpu_count() minus --cpu-headroom.")
+    parser.add_argument("--build-workers", type=int, help="Concurrent candidate build/export workers. Defaults to min(32, effective workers).")
     parser.add_argument("--cpu-headroom", type=int, default=2, help="CPU cores to leave idle when --workers is 0 or omitted by an auto-worker profile.")
     parser.add_argument("--max-workers", type=int, help="Upper bound for auto worker resolution.")
     parser.add_argument("--max-actions", type=int)
@@ -623,6 +1302,22 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--progress-mode", choices=["auto", "line", "overwrite", "file"], default="file")
     parser.add_argument("--manual-slots", type=int)
     parser.add_argument("--scenario-limit", type=int, default=48)
+    parser.add_argument("--scenario-min-drop", type=float, default=250.0)
+    parser.add_argument("--scenario-max-prefix-actions", type=int, default=140)
+    parser.add_argument("--scenario-max-trigger-turn", type=int, default=18)
+    parser.add_argument("--scenario-gate", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--scenario-gate-candidates", type=int, default=16)
+    parser.add_argument("--scenario-gate-limit", type=int, default=24)
+    parser.add_argument("--scenario-takeover-actions", type=int, default=80)
+    parser.add_argument("--scenario-penalty-margin", type=float, default=180.0)
+    parser.add_argument("--loss-digest", type=Path)
+    parser.add_argument("--feedback-mode", choices=["off", "next_gen", "closed_loop"], default="closed_loop")
+    parser.add_argument("--feedback-path", type=Path)
+    parser.add_argument("--microburst-fraction", type=float, default=0.15)
+    parser.add_argument("--microburst-max", type=int, default=48)
+    parser.add_argument("--holdout-feedback-mode", choices=["audit_only", "weak_signal"], default="audit_only")
+    parser.add_argument("--min-diversity-distance", type=float, default=0.08)
+    parser.add_argument("--near-clean-no-result-rate", type=float, default=0.02)
     parser.add_argument("--min-holdout-score-delta", type=float)
     parser.add_argument("--strip-search-wrapper", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--include-portfolio", action=argparse.BooleanOptionalAction, default=True)
@@ -639,6 +1334,13 @@ def main(argv: list[str] | None = None) -> int:
     p_status = sub.add_parser("status", help="Print current discovery state.")
     p_status.add_argument("--out", type=Path, default=DEFAULT_OUT)
 
+    p_audit = sub.add_parser("audit", help="Classify final discovery output and write decision_brief.md.")
+    p_audit.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    p_audit.add_argument("--submission", type=Path)
+    p_audit.add_argument("--min-holdout-score-delta", type=float, default=8.0)
+    p_audit.add_argument("--max-no-result-rate", type=float, default=0.01)
+    p_audit.add_argument("--near-clean-no-result-rate", type=float, default=0.02)
+
     p_mine = sub.add_parser("mine-losses", help="Mine collapse scenarios from game_records.")
     p_mine.add_argument("inputs", nargs="+", type=Path)
     p_mine.add_argument("--out", type=Path, default=DEFAULT_OUT / "scenarios.json")
@@ -646,7 +1348,10 @@ def main(argv: list[str] | None = None) -> int:
     p_mine.add_argument("--limit", type=int, default=64)
     p_mine.add_argument("--max-prefix-actions", type=int, default=140)
     p_mine.add_argument("--max-trigger-turn", type=int, default=16)
-    p_mine.add_argument("--min-drop", type=float, default=450.0)
+    p_mine.add_argument("--min-drop", type=float, default=250.0)
+
+    p_digest = sub.add_parser("digest-losses", help="Build loss_digest.json from generation scenarios.")
+    p_digest.add_argument("--out", type=Path, default=DEFAULT_OUT)
 
     p_scenario = sub.add_parser("run-scenarios", help="Replay mined scenarios against candidates.")
     p_scenario.add_argument("--scenarios", type=Path, required=True)
@@ -668,9 +1373,13 @@ def main(argv: list[str] | None = None) -> int:
         result = run_engine(args)
     elif args.cmd == "status":
         result = status(args)
+    elif args.cmd == "audit":
+        result = audit(args)
     elif args.cmd == "mine-losses":
         scenarios = mine_losses(args.inputs, args.out, args.focus, args.limit, args.max_prefix_actions, args.max_trigger_turn, args.min_drop)
         result = {"out": str(args.out), "scenarios": len(scenarios)}
+    elif args.cmd == "digest-losses":
+        result = digest_losses_command(args)
     elif args.cmd == "run-scenarios":
         rows = run_scenarios(args.scenarios, args.candidate, args.opponent, args.out, args.limit, args.takeover_actions, args.seed)
         result = {"out": str(args.out), "rows": len(rows)}

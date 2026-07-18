@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import gzip
 import json
+from collections import Counter, defaultdict
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -216,6 +217,99 @@ def mine_losses(
     return scenarios
 
 
+TAG_TO_MOTIFS = {
+    "focus_hand_drop": ["draw_recovery", "hand_disruption"],
+    "opponent_hand_surge": ["hand_disruption"],
+    "opponent_took_prize": ["defensive_tools", "switch_pivot"],
+    "focus_prize_regressed": ["defensive_tools"],
+    "focus_deck_drop": ["draw_recovery", "resource_safety"],
+    "opponent_deck_recovered": ["resource_denial"],
+    "focus_active_changed": ["switch_pivot", "defensive_tools"],
+}
+
+TAG_TO_AVOID = {
+    "focus_hand_drop": ["cut_draw_density"],
+    "opponent_took_prize": ["cut_defensive_tools"],
+    "focus_deck_drop": ["overdraw_packages"],
+    "focus_active_changed": ["cut_switch_density"],
+    "opponent_deck_recovered": ["cut_resource_denial"],
+}
+
+
+def load_scenarios(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    if isinstance(data, dict):
+        data = data.get("scenarios", [])
+    return [row for row in data if isinstance(row, dict)]
+
+
+def digest_scenarios(scenarios: list[dict[str, Any]], out: Path) -> dict[str, Any]:
+    tags: Counter[str] = Counter()
+    opponents: Counter[str] = Counter()
+    focus: Counter[str] = Counter()
+    drops_by_tag: dict[str, list[float]] = defaultdict(list)
+    by_focus_opponent: dict[str, Counter[str]] = defaultdict(Counter)
+    drops_by_focus_opponent: dict[str, list[float]] = defaultdict(list)
+    for scenario in scenarios:
+        opponent = str(scenario.get("opponent", ""))
+        focus_name = str(scenario.get("focus", ""))
+        opponents.update([opponent])
+        focus.update([focus_name])
+        drop = float(scenario.get("drop") or 0.0)
+        key = f"{focus_name}:::{opponent}"
+        drops_by_focus_opponent[key].append(drop)
+        for tag in scenario.get("tags") or []:
+            tag = str(tag)
+            tags[tag] += 1
+            drops_by_tag[tag].append(drop)
+            by_focus_opponent[key][tag] += 1
+    motif_scores: Counter[str] = Counter()
+    avoid_scores: Counter[str] = Counter()
+    for tag, count in tags.items():
+        for motif in TAG_TO_MOTIFS.get(tag, []):
+            motif_scores[motif] += count
+        for avoid in TAG_TO_AVOID.get(tag, []):
+            avoid_scores[avoid] += count
+    digest = {
+        "scenario_count": len(scenarios),
+        "warnings": [] if scenarios else ["no_scenarios_mined"],
+        "top_tags": dict(tags.most_common(16)),
+        "top_opponents": {k: v for k, v in opponents.most_common(12) if k},
+        "top_focus": {k: v for k, v in focus.most_common(12) if k},
+        "avg_drop_by_tag": {
+            tag: sum(values) / len(values)
+            for tag, values in sorted(drops_by_tag.items(), key=lambda item: len(item[1]), reverse=True)
+        },
+        "recommended_motifs": [name for name, _ in motif_scores.most_common(8)],
+        "avoid_mutations": [name for name, _ in avoid_scores.most_common(8)],
+        "failure_fingerprints": [
+            {
+                "focus": key.split(":::", 1)[0],
+                "opponent": key.split(":::", 1)[1] if ":::" in key else "",
+                "count": sum(counter.values()),
+                "top_tags": dict(counter.most_common(8)),
+                "avg_drop": sum(drops_by_focus_opponent[key]) / max(1, len(drops_by_focus_opponent[key])),
+            }
+            for key, counter in sorted(by_focus_opponent.items(), key=lambda item: sum(item[1].values()), reverse=True)[:24]
+        ],
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(digest, indent=2), encoding="utf-8")
+    return digest
+
+
+def digest_loss_files(scenario_paths: list[Path], out: Path) -> dict[str, Any]:
+    scenarios: list[dict[str, Any]] = []
+    for path in scenario_paths:
+        scenarios.extend(load_scenarios(path))
+    return digest_scenarios(scenarios, out)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Mine early/mid-game loss-collapse scenarios from local_eval game_records.")
     parser.add_argument("inputs", nargs="+", type=Path)
@@ -225,6 +319,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-prefix-actions", type=int, default=140)
     parser.add_argument("--max-trigger-turn", type=int, default=16)
     parser.add_argument("--min-drop", type=float, default=450.0)
+    parser.add_argument("--digest-out", type=Path)
     args = parser.parse_args(argv)
     scenarios = mine_losses(
         args.inputs,
@@ -235,7 +330,10 @@ def main(argv: list[str] | None = None) -> int:
         args.max_trigger_turn,
         args.min_drop,
     )
-    print(json.dumps({"out": str(args.out), "scenarios": len(scenarios)}, indent=2))
+    result = {"out": str(args.out), "scenarios": len(scenarios)}
+    if args.digest_out:
+        result["digest"] = digest_scenarios([scenario.to_dict() for scenario in scenarios], args.digest_out)
+    print(json.dumps(result, indent=2))
     return 0
 
 

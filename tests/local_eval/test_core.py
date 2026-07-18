@@ -9,7 +9,7 @@ from local_eval.archive import SubmissionArchiveError, safe_extract_tar_gz
 from local_eval.evaluator import run_match, save_report
 from local_eval.models import EvalConfig, GameResult
 from local_eval.rating import KaggleStyleRating
-from local_eval.referee import InvalidAction, validate_action, validate_deck
+from local_eval.referee import InvalidAction, _should_keep_trace, validate_action, validate_deck
 
 
 def test_validate_deck_requires_sixty_ints():
@@ -197,6 +197,24 @@ def test_save_report_writes_debug_game_records(tmp_path: Path):
     games = (out / "games.jsonl").read_text().splitlines()
     assert len(games) == len(report.games)
     assert json.loads(games[0])["game_id"] == report.games[0].game_id
+
+
+def test_losses_record_mode_keeps_decisive_losses_without_focus():
+    result = GameResult(
+        game_id="g000000",
+        p0="winner",
+        p1="loser",
+        seed=1,
+        result=0,
+        outcome="P0_WIN",
+        winner="winner",
+        loser="loser",
+        reason="RESULT",
+        actions=10,
+        duration_s=0.1,
+    )
+
+    assert _should_keep_trace(result, EvalConfig(record_mode="losses")) is True
 
 
 def test_run_match_can_print_progress(tmp_path: Path, capsys):

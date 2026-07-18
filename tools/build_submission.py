@@ -101,6 +101,12 @@ def _gt_weight(name, default):
         return default
 
 
+def _gt_model_noise(index):
+    if GT_OPPONENT_MODEL != "noisy":
+        return 0.0
+    return ((index * 1103515245 + 12345) % 997) - 498.0
+
+
 def _gt_to_builtin(value):
     if isinstance(value, dict):
         return {k: _gt_to_builtin(v) for k, v in value.items()}
@@ -193,6 +199,14 @@ def _gt_eval_state(obs, me_idx):
         value -= 1.1 * getattr(pk, "hp", 0)
         if is_ex_pokemon(pk):
             value += 650.0
+    if GT_OPPONENT_MODEL == "aggro_bias":
+        value += (len(getattr(opp, "prize", []) or []) - len(getattr(me, "prize", []) or [])) * 1700.0
+        value += 600.0 if active_pokemon(opp) is not None else 0.0
+    elif GT_OPPONENT_MODEL == "stall_bias":
+        value += (60 - opp_deck) * 180.0
+        value -= max(0, 7 - my_deck) * 1600.0
+    elif GT_OPPONENT_MODEL == "noisy":
+        value -= 350.0
     return value
 
 
@@ -265,7 +279,7 @@ def _gt_candidate_order(obs, hidx):
         return [hidx]
     ranked = sorted(
         range(len(scores)),
-        key=lambda i: (_gt_option_tactical_bonus(obs, obs.select.option[i], scores[i]), scores[i]),
+        key=lambda i: (_gt_option_tactical_bonus(obs, obs.select.option[i], scores[i]) + _gt_model_noise(i), scores[i]),
         reverse=True,
     )
     order = []

@@ -13,6 +13,7 @@ class PsroResult:
     payoff: list[list[float]]
     weights: dict[str, float]
     exploitability_proxy: float
+    niches: list[dict[str, object]]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -20,6 +21,7 @@ class PsroResult:
             "payoff": self.payoff,
             "weights": self.weights,
             "exploitability_proxy": self.exploitability_proxy,
+            "niches": self.niches,
         }
 
 
@@ -73,18 +75,48 @@ def solve_psro(report: MatchReport, names: list[str] | None = None, iterations: 
     names, matrix = payoff_matrix(report, names)
     weights = replicator_dynamics(matrix, iterations=iterations)
     if not names:
-        return PsroResult([], [], {}, 0.0)
+        return PsroResult([], [], {}, 0.0, [])
     weighted_payoffs = [
         sum(matrix[i][j] * weights[j] for j in range(len(names)))
         for i in range(len(names))
     ]
     value = sum(weights[i] * weighted_payoffs[i] for i in range(len(names)))
     exploitability = max(weighted_payoffs) - value if weighted_payoffs else 0.0
+    weights_by_name = {name: weights[i] for i, name in enumerate(names) if weights[i] >= 0.001}
+    niches: list[dict[str, object]] = []
+    for i, name in enumerate(names):
+        weight = weights_by_name.get(name, 0.0)
+        if weight < 0.001:
+            continue
+        beats = sorted(
+            ((matrix[i][j], names[j]) for j in range(len(names)) if i != j and matrix[i][j] > 0.15),
+            reverse=True,
+        )[:5]
+        loses_to = sorted(
+            ((matrix[i][j], names[j]) for j in range(len(names)) if i != j and matrix[i][j] < -0.15),
+        )[:5]
+        role = "generalist"
+        if weight >= 0.20 and beats and loses_to:
+            role = "anti_meta_specialist"
+        elif weight >= 0.20:
+            role = "meta_anchor"
+        elif beats:
+            role = "counterpick"
+        niches.append(
+            {
+                "candidate": name,
+                "weight": weight,
+                "role": role,
+                "beats": [opponent for _, opponent in beats],
+                "loses_to": [opponent for _, opponent in loses_to],
+            }
+        )
     return PsroResult(
         names=names,
         payoff=matrix,
-        weights={name: weights[i] for i, name in enumerate(names) if weights[i] >= 0.001},
+        weights=weights_by_name,
         exploitability_proxy=exploitability,
+        niches=niches,
     )
 
 

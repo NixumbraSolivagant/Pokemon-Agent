@@ -71,6 +71,17 @@ def deck_hash(deck: list[int]) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
+def deck_distance(a: list[int], b: list[int]) -> float:
+    ca = Counter(a)
+    cb = Counter(b)
+    keys = set(ca) | set(cb)
+    if not keys:
+        return 0.0
+    intersection = sum(min(ca[key], cb[key]) for key in keys)
+    union = sum(max(ca[key], cb[key]) for key in keys)
+    return 1.0 - intersection / max(1, union)
+
+
 def card_index(path: Path = CARD_DATA) -> dict[int, dict[str, str]]:
     if not path.exists():
         return {}
@@ -140,6 +151,85 @@ def manual_motifs() -> list[Motif]:
     ]
     for name, swaps, note in GT_PRIOR_PACKAGES:
         motifs.append(Motif(f"prior_{name}", [add for add, _ in swaps], note, "great_tusk", "prior_deck_space"))
+    return motifs
+
+
+LOSS_DIGEST_MOTIFS = {
+    "draw_recovery": ([1123, 1227, 1097], "Loss digest: restore draw and discard recursion after hand/deck collapse."),
+    "hand_disruption": ([1087, 1186, 1197], "Loss digest: pressure opponent hand after hand surge or setup failure."),
+    "defensive_tools": ([1177, 1174, 1147], "Loss digest: add defensive tools and healing after prize-race collapse."),
+    "switch_pivot": ([1160, 1203, 1161], "Loss digest: add pivot protection after active disruption."),
+    "resource_denial": ([1081, 1139, 1149], "Loss digest: deny opponent recovery and energy loops."),
+    "resource_safety": ([1152, 1097, 1121], "Loss digest: protect recursion and repeated Land Collapse turns."),
+}
+
+
+def read_feedback(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def motifs_from_loss_digest(path: Path | None) -> list[Motif]:
+    if path is None or not path.exists():
+        return []
+    try:
+        digest = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    motifs: list[Motif] = []
+    for name in digest.get("recommended_motifs", []):
+        spec = LOSS_DIGEST_MOTIFS.get(str(name))
+        if not spec:
+            continue
+        cards, note = spec
+        motifs.append(Motif(str(name), list(cards), note, "great_tusk", f"loss_digest:{name}"))
+    return motifs
+
+
+def motifs_from_feedback(path: Path | None) -> list[Motif]:
+    feedback = read_feedback(path)
+    motifs: list[Motif] = []
+    seen: set[tuple[str, str]] = set()
+    for item in feedback.get("pressure_items", []):
+        if not isinstance(item, dict):
+            continue
+        pressure_id = str(item.get("pressure_id") or item.get("kind") or "pressure")
+        family_hint = str(item.get("target_family") or "great_tusk")
+        if family_hint == "unknown":
+            family_hint = "great_tusk"
+        for name in item.get("recommended_motifs", []):
+            spec = LOSS_DIGEST_MOTIFS.get(str(name))
+            if not spec:
+                continue
+            key = (pressure_id, str(name))
+            if key in seen:
+                continue
+            seen.add(key)
+            cards, note = spec
+            motifs.append(
+                Motif(
+                    f"pressure_{str(name)}_{len(motifs)}",
+                    list(cards),
+                    f"Pressure {pressure_id}: {note}",
+                    family_hint,
+                    f"pressure:{pressure_id}",
+                )
+            )
+    for name in feedback.get("recommended_motifs", []):
+        spec = LOSS_DIGEST_MOTIFS.get(str(name))
+        if not spec:
+            continue
+        key = ("summary", str(name))
+        if key in seen:
+            continue
+        seen.add(key)
+        cards, note = spec
+        motifs.append(Motif(f"pressure_summary_{name}", list(cards), f"Feedback summary: {note}", "great_tusk", "pressure:summary"))
     return motifs
 
 
@@ -370,6 +460,295 @@ def tag_sweep_configs(incumbent: BuildConfig, generation: int, out_dir: Path, li
     return configs
 
 
+def tag_combo_configs(incumbent: BuildConfig, generation: int, out_dir: Path, limit: int, rng: random.Random) -> list[BuildConfig]:
+    if limit <= 0:
+        return []
+    try:
+        deck = read_deck_from_tarball(incumbent.base)
+    except Exception:
+        return []
+    tags = tag_cards(card_index())
+    tag_pairs = [
+        ("search_draw", ("search", "draw")),
+        ("search_recovery", ("search", "recovery")),
+        ("draw_recovery", ("draw", "recovery")),
+        ("switch_defense", ("switch", "tool")),
+        ("gust_denial", ("gust", "energy")),
+        ("stadium_resource", ("stadium", "recovery")),
+        ("supporter_item", ("supporter", "item")),
+        ("hand_energy", ("supporter", "energy")),
+    ]
+    candidates: list[tuple[str, list[int]]] = []
+    for combo_name, combo_tags in tag_pairs:
+        pools: list[list[int]] = []
+        for tag in combo_tags:
+            cards = [card_id for card_id in tags.get(tag, []) if 1000 <= card_id <= 1300]
+            rng.shuffle(cards)
+            pools.append(cards[:10])
+        if len(pools) < 2 or not all(pools):
+            continue
+        for a in pools[0]:
+            for b in pools[1]:
+                if a == b:
+                    continue
+                candidates.append((combo_name, [a, b]))
+    rng.shuffle(candidates)
+    configs: list[BuildConfig] = []
+    for index, (combo_name, cards) in enumerate(candidates):
+        if len(configs) >= limit:
+            break
+        motif = Motif(
+            f"tagcombo_{combo_name}_{'_'.join(map(str, cards))}",
+            cards,
+            f"Exploration tag combo from card data: {combo_name}.",
+            "great_tusk",
+            "card_data_combo",
+        )
+        try:
+            new_deck = insert_motif(deck, motif, rng, GREAT_TUSK_CORE_IDS)
+        except Exception:
+            continue
+        if deck_hash(new_deck) == deck_hash(deck):
+            continue
+        name = f"d{generation:03d}_tagcombo_{index:03d}_{combo_name}"
+        configs.append(
+            replace(
+                incumbent,
+                name=name,
+                out=out_dir / f"{name}.tar.gz",
+                deck_override=new_deck,
+                origin="tag_combo",
+                notes=motif.note,
+            )
+        )
+    return configs
+
+
+def motif_combo_configs(
+    incumbent: BuildConfig,
+    generation: int,
+    out_dir: Path,
+    motifs: list[Motif],
+    seed_decks: list[tuple[str, str, Path, list[int]]],
+    limit: int,
+    rng: random.Random,
+) -> list[BuildConfig]:
+    if limit <= 0:
+        return []
+    motif_order = list(motifs)
+    rng.shuffle(motif_order)
+    bases = seed_decks[:]
+    rng.shuffle(bases)
+    pairs: list[tuple[Motif, Motif]] = []
+    for i, first in enumerate(motif_order):
+        for second in motif_order[i + 1 :]:
+            if first.name == second.name:
+                continue
+            pairs.append((first, second))
+    rng.shuffle(pairs)
+    configs: list[BuildConfig] = []
+    for index, (first, second) in enumerate(pairs):
+        if len(configs) >= limit:
+            break
+        for family, label, base_path, deck in bases:
+            if len(configs) >= limit:
+                break
+            if first.family_hint not in {"any", family} and not (first.family_hint == "metal" and "metal" in family):
+                continue
+            if second.family_hint not in {"any", family} and not (second.family_hint == "metal" and "metal" in family):
+                continue
+            protected = GREAT_TUSK_CORE_IDS if family == "great_tusk" else set()
+            try:
+                new_deck = insert_motif(deck, first, rng, protected)
+                new_deck = insert_motif(new_deck, second, rng, protected | set(first.cards))
+            except Exception:
+                continue
+            if deck_hash(new_deck) == deck_hash(deck):
+                continue
+            safe_first = "".join(ch if ch.isalnum() else "_" for ch in first.name)[-24:]
+            safe_second = "".join(ch if ch.isalnum() else "_" for ch in second.name)[-24:]
+            name = f"d{generation:03d}_motifcombo_{label}_{index:03d}_{safe_first}_{safe_second}"[:90]
+            configs.append(
+                BuildConfig(
+                    name=name,
+                    family=family,
+                    base=base_path,
+                    out=out_dir / f"{name}.tar.gz",
+                    injection="great_tusk" if family == "great_tusk" else "none",
+                    enable_search=family == "great_tusk",
+                    deck_override=new_deck,
+                    deck_files=("deck.csv", "lucario_deck.csv") if family == "lucario" else ("deck.csv",),
+                    origin=f"motif_combo:{first.source}+{second.source}",
+                    notes=f"Combined motifs: {first.note} / {second.note}",
+                )
+            )
+    return configs
+
+
+def search_strategy_matrix_configs(incumbent: BuildConfig, generation: int, out_dir: Path, limit: int) -> list[BuildConfig]:
+    if limit <= 0:
+        return []
+    strategy_specs = [
+        ("mill_extreme", {"opp_mill": 1250.0, "opp_deckout_bonus": 24000.0, "self_deckout_penalty": 15000.0}),
+        ("resource_safe", {"self_mill_penalty": 500.0, "deck_delta": 80.0, "hand_delta": 80.0}),
+        ("attack_ready", {"great_tusk_ready": 9000.0, "supporter_played_attack": 7000.0, "explorer_ready": 18000.0}),
+        ("prize_respect", {"prize_delta": 5200.0, "great_tusk_active": 1100.0}),
+        ("late_override", {"opp_deckout_bonus": 30000.0, "opp_mill": 1050.0}),
+        ("anti_setup", {"hand_delta": 110.0, "opp_mill": 1080.0, "prize_delta": 4300.0}),
+    ]
+    configs: list[BuildConfig] = []
+    for strat_name, weights in strategy_specs:
+        for search_name, cand, budget, margin, rollout, note in SEARCH_PRIORS:
+            if len(configs) >= limit:
+                return configs
+            merged = dict(incumbent.strategy_weights)
+            merged.update(weights)
+            name = f"d{generation:03d}_matrix_{strat_name}_{search_name}"
+            configs.append(
+                replace(
+                    incumbent,
+                    name=name,
+                    out=out_dir / f"{name}.tar.gz",
+                    search_candidates=cand,
+                    search_budget_s=budget,
+                    search_margin=margin,
+                    search_rollout_steps=rollout,
+                    strategy_weights=merged,
+                    policy_variant=f"matrix_{strat_name}",
+                    origin="search_strategy_matrix",
+                    notes=f"Exploration matrix: {strat_name} with {search_name}. {note}",
+                )
+            )
+    return configs
+
+
+def opponent_search_matrix_configs(incumbent: BuildConfig, generation: int, out_dir: Path, limit: int) -> list[BuildConfig]:
+    if limit <= 0:
+        return []
+    model_weights = [
+        ("noisy", {"hand_delta": 70.0}),
+        ("aggro_bias", {"prize_delta": 5700.0, "great_tusk_ready": 7600.0}),
+        ("stall_bias", {"opp_mill": 1180.0, "opp_deckout_bonus": 24500.0}),
+    ]
+    configs: list[BuildConfig] = []
+    for model, weights in model_weights:
+        for search_name, cand, budget, margin, rollout, note in SEARCH_PRIORS:
+            if len(configs) >= limit:
+                return configs
+            merged = dict(incumbent.strategy_weights)
+            merged.update(weights)
+            name = f"d{generation:03d}_oppmatrix_{model}_{search_name}"
+            configs.append(
+                replace(
+                    incumbent,
+                    name=name,
+                    out=out_dir / f"{name}.tar.gz",
+                    search_candidates=cand,
+                    search_budget_s=budget,
+                    search_margin=margin,
+                    search_rollout_steps=rollout,
+                    strategy_weights=merged,
+                    policy_variant=f"opponent_model_{model}",
+                    opponent_model=model,
+                    origin="opponent_search_matrix",
+                    notes=f"Opponent-model exploration: {model} with {search_name}. {note}",
+                )
+            )
+    return configs
+
+
+def pressure_strategy_configs(incumbent: BuildConfig, generation: int, out_dir: Path, feedback_path: Path | None, limit: int) -> list[BuildConfig]:
+    feedback = read_feedback(feedback_path)
+    configs: list[BuildConfig] = []
+    for index, item in enumerate(feedback.get("pressure_items", [])):
+        if len(configs) >= limit:
+            break
+        if not isinstance(item, dict):
+            continue
+        shifts = {str(k): float(v) for k, v in dict(item.get("strategy_shifts") or {}).items()}
+        if not shifts:
+            continue
+        merged = dict(incumbent.strategy_weights)
+        merged.update(shifts)
+        pressure_id = str(item.get("pressure_id") or f"pressure_{index}")
+        safe_id = "".join(ch if ch.isalnum() else "_" for ch in pressure_id)[-48:]
+        name = f"d{generation:03d}_pressure_strategy_{index}_{safe_id}"[:90]
+        configs.append(
+            replace(
+                incumbent,
+                name=name,
+                out=out_dir / f"{name}.tar.gz",
+                strategy_weights=merged,
+                policy_variant=f"pressure_{str(item.get('kind') or 'shift')}"[:64],
+                origin=f"pressure:{pressure_id}",
+                notes=f"Pressure-driven strategy shift from {pressure_id}: {item.get('evidence', {})}",
+            )
+        )
+    return configs
+
+
+def pressure_opponent_model_configs(incumbent: BuildConfig, generation: int, out_dir: Path, feedback_path: Path | None, limit: int) -> list[BuildConfig]:
+    feedback = read_feedback(feedback_path)
+    if not feedback or limit <= 0:
+        return []
+    models = [
+        ("noisy", {"hand_delta": 70.0}, "Rollout assumes occasional opponent mistakes."),
+        ("aggro_bias", {"prize_delta": 5700.0, "great_tusk_ready": 7600.0}, "Stress test prize-race pressure."),
+        ("stall_bias", {"opp_mill": 1180.0, "opp_deckout_bonus": 24500.0}, "Stress test stall/deckout pressure."),
+    ]
+    configs: list[BuildConfig] = []
+    for index, (model, shifts, note) in enumerate(models[:limit]):
+        merged = dict(incumbent.strategy_weights)
+        merged.update(shifts)
+        name = f"d{generation:03d}_pressure_oppmodel_{model}"
+        configs.append(
+            replace(
+                incumbent,
+                name=name,
+                out=out_dir / f"{name}.tar.gz",
+                strategy_weights=merged,
+                policy_variant=f"opponent_model_{model}",
+                opponent_model=model,
+                origin="pressure:opponent_model",
+                notes=note,
+            )
+        )
+    return configs
+
+
+def cfg_deck_signature(cfg: BuildConfig) -> list[int] | None:
+    if cfg.deck_override:
+        return [int(card_id) for card_id in cfg.deck_override]
+    try:
+        deck = read_deck_from_tarball(cfg.base)
+    except Exception:
+        return None
+    if cfg.deck_swaps:
+        counts = Counter(deck)
+        for add_id, cut_id in cfg.deck_swaps:
+            if counts[int(cut_id)] > 0:
+                counts[int(cut_id)] -= 1
+                counts[int(add_id)] += 1
+        out: list[int] = []
+        for card_id, count in counts.items():
+            out.extend([card_id] * count)
+        return out
+    return deck
+
+
+def same_strategy_shape(a: BuildConfig, b: BuildConfig) -> bool:
+    return (
+        a.strategy_weights == b.strategy_weights
+        and a.policy_variant == b.policy_variant
+        and a.opponent_model == b.opponent_model
+        and a.injection == b.injection
+        and a.search_candidates == b.search_candidates
+        and a.search_budget_s == b.search_budget_s
+        and a.search_margin == b.search_margin
+        and a.search_rollout_steps == b.search_rollout_steps
+    )
+
+
 def incumbent_from_tarball(path: Path, out_dir: Path) -> BuildConfig:
     metadata = read_build_metadata(path)
     cfg = BuildConfig(
@@ -434,6 +813,10 @@ def generate_discovery_configs(
     seed: int,
     hof_paths: list[Path] | None = None,
     include_portfolio: bool = True,
+    loss_digest_path: Path | None = None,
+    feedback_path: Path | None = None,
+    pressure_only: bool = False,
+    min_diversity_distance: float = 0.0,
 ) -> list[BuildConfig]:
     rng = random.Random(seed + generation * 1009)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -442,21 +825,41 @@ def generate_discovery_configs(
     incumbent = replace(incumbent, name=f"d{generation:03d}_incumbent", out=out_dir / f"d{generation:03d}_incumbent.tar.gz")
 
     seed_decks = seed_decks_from_paths([incumbent_tarball, *hof_paths])
-    motifs = [*manual_motifs(), *motifs_from_decks([incumbent_tarball, *hof_paths])]
-    motif_limit = max(8, population // 3)
     configs: list[BuildConfig] = [incumbent]
-    configs.extend(reference_seed_configs(out_dir, generation))
-    configs.extend(motif_configs(incumbent, generation, out_dir, motifs, seed_decks, motif_limit, rng))
-    configs.extend(tag_sweep_configs(incumbent, generation, out_dir, max(4, population // 8), rng))
-    configs.extend(strategy_variants(incumbent, generation, out_dir))
-    configs.extend(great_tusk_prior_configs(incumbent, generation, out_dir, max(12, population // 4)))
-    if include_portfolio:
-        configs.extend(metal_prior_configs(generation, out_dir, max(8, population // 8)))
-        configs.extend(portfolio_seed_configs(generation, out_dir))
+    pressure_motifs = motifs_from_feedback(feedback_path)
+    has_feedback = bool(pressure_motifs or read_feedback(feedback_path).get("pressure_items"))
+    pressure_budget = max(0, int(population * 0.70)) if has_feedback else 0
+    if pressure_budget:
+        configs.extend(motif_configs(incumbent, generation, out_dir, pressure_motifs, seed_decks, max(4, pressure_budget // 2), rng))
+        configs.extend(motif_combo_configs(incumbent, generation, out_dir, pressure_motifs, seed_decks, max(4, pressure_budget // 5), rng))
+        configs.extend(pressure_strategy_configs(incumbent, generation, out_dir, feedback_path, max(3, pressure_budget // 4)))
+        configs.extend(pressure_opponent_model_configs(incumbent, generation, out_dir, feedback_path, max(1, pressure_budget // 12)))
+        configs.extend(opponent_search_matrix_configs(incumbent, generation, out_dir, max(6, pressure_budget // 8)))
+    if pressure_only and has_feedback:
+        configs.extend(tag_combo_configs(incumbent, generation, out_dir, max(8, population // 3), rng))
+        configs.extend(search_strategy_matrix_configs(incumbent, generation, out_dir, max(12, population // 2)))
+        configs.extend(opponent_search_matrix_configs(incumbent, generation, out_dir, max(8, population // 4)))
+    if not pressure_only:
+        motifs = [*motifs_from_loss_digest(loss_digest_path), *manual_motifs(), *motifs_from_decks([incumbent_tarball, *hof_paths])]
+        motif_limit = max(8, population // 3)
+        configs.extend(reference_seed_configs(out_dir, generation))
+        configs.extend(motif_configs(incumbent, generation, out_dir, motifs, seed_decks, motif_limit, rng))
+        configs.extend(motif_combo_configs(incumbent, generation, out_dir, motifs, seed_decks, max(8, population // 4), rng))
+        configs.extend(tag_sweep_configs(incumbent, generation, out_dir, max(4, population // 8), rng))
+        configs.extend(tag_combo_configs(incumbent, generation, out_dir, max(8, population // 3), rng))
+        configs.extend(strategy_variants(incumbent, generation, out_dir))
+        configs.extend(search_strategy_matrix_configs(incumbent, generation, out_dir, max(12, population // 4)))
+        configs.extend(opponent_search_matrix_configs(incumbent, generation, out_dir, max(8, population // 8)))
+        configs.extend(great_tusk_prior_configs(incumbent, generation, out_dir, max(12, population // 4)))
+        if include_portfolio:
+            configs.extend(metal_prior_configs(generation, out_dir, max(8, population // 8)))
+            configs.extend(portfolio_seed_configs(generation, out_dir))
 
     unique: list[BuildConfig] = []
     seen_name: set[str] = set()
     seen_shape: set[str] = set()
+    deck_signatures: list[tuple[BuildConfig, list[int]]] = []
+    diversity_deferred: list[tuple[BuildConfig, str, list[int] | None]] = []
     for cfg in configs:
         if cfg.name in seen_name:
             continue
@@ -468,15 +871,40 @@ def generate_discovery_configs(
                 "strategy": cfg.strategy_weights,
                 "search": [cfg.search_candidates, cfg.search_budget_s, cfg.search_margin, cfg.search_rollout_steps],
                 "injection": cfg.injection,
+                "policy_variant": cfg.policy_variant,
+                "opponent_model": cfg.opponent_model,
             },
             sort_keys=True,
         )
         if shape in seen_shape:
             continue
+        signature = cfg_deck_signature(cfg) if min_diversity_distance > 0 else None
+        if signature is not None:
+            too_close = False
+            for prior_cfg, prior_signature in deck_signatures:
+                if same_strategy_shape(cfg, prior_cfg) and deck_distance(signature, prior_signature) < min_diversity_distance:
+                    too_close = True
+                    break
+            if too_close:
+                diversity_deferred.append((cfg, shape, signature))
+                continue
         seen_name.add(cfg.name)
         seen_shape.add(shape)
         cfg.origin = cfg.origin or "discovery_space"
         unique.append(cfg)
+        if signature is not None:
+            deck_signatures.append((cfg, signature))
         if len(unique) >= population:
             break
+    for cfg, shape, signature in diversity_deferred:
+        if len(unique) >= population:
+            break
+        if cfg.name in seen_name or shape in seen_shape:
+            continue
+        seen_name.add(cfg.name)
+        seen_shape.add(shape)
+        cfg.origin = cfg.origin or "discovery_space"
+        unique.append(cfg)
+        if signature is not None:
+            deck_signatures.append((cfg, signature))
     return unique

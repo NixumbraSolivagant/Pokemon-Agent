@@ -501,7 +501,7 @@ def _should_keep_trace(result: GameResult, config: EvalConfig) -> bool:
     if mode == "losses":
         if focus:
             return result.loser == focus or (result.reason != "RESULT" and focus in {result.p0, result.p1})
-        return result.reason != "RESULT" or result.outcome == "NO_RESULT"
+        return bool(result.loser) or result.reason != "RESULT" or result.outcome == "NO_RESULT"
     if mode == "sample":
         if result.reason != "RESULT" or result.outcome == "NO_RESULT":
             return True
