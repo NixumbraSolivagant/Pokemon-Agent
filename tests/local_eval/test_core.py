@@ -197,3 +197,55 @@ def test_save_report_writes_debug_game_records(tmp_path: Path):
     games = (out / "games.jsonl").read_text().splitlines()
     assert len(games) == len(report.games)
     assert json.loads(games[0])["game_id"] == report.games[0].game_id
+
+
+def test_run_match_can_print_progress(tmp_path: Path, capsys):
+    baseline = Path("基准/submission_sorce_700.tar.gz")
+    report = run_match(
+        baseline,
+        baseline,
+        games=1,
+        config=EvalConfig(
+            max_actions=20,
+            run_timeout_s=60,
+            progress=True,
+            progress_label="test_progress",
+            progress_interval_s=0.0,
+        ),
+        project_root=Path.cwd(),
+    )
+
+    output = capsys.readouterr().out
+
+    assert len(report.games) == 1
+    assert "[test_progress] start" in output
+    assert "[test_progress] games" in output
+    assert "1/1" in output
+
+
+def test_run_match_can_write_progress_file(tmp_path: Path, capsys):
+    baseline = Path("基准/submission_sorce_700.tar.gz")
+    progress_file = tmp_path / "progress.txt"
+    report = run_match(
+        baseline,
+        baseline,
+        games=1,
+        config=EvalConfig(
+            max_actions=20,
+            run_timeout_s=60,
+            progress=True,
+            progress_label="file_progress",
+            progress_interval_s=0.0,
+            progress_mode="file",
+            progress_file=str(progress_file),
+        ),
+        project_root=Path.cwd(),
+    )
+
+    output = capsys.readouterr().out
+    progress = progress_file.read_text(encoding="utf-8")
+
+    assert len(report.games) == 1
+    assert output == ""
+    assert "[file_progress] games" in progress
+    assert "1/1" in progress

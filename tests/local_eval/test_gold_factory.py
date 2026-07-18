@@ -64,6 +64,8 @@ def test_kaggle_export_keeps_search_wrapper_by_default(tmp_path: Path):
 
     assert SEARCH_WRAPPER_MARKER in main_py
     assert "def _gt_search_action" in main_py
+    assert main_py.rfind("kaggle_agent = agent") > main_py.rfind("def _gt_search_action")
+    assert main_py.rfind("kaggle_agent = agent") > main_py.rfind("def agent")
 
 
 def test_kaggle_export_can_strip_search_wrapper_explicitly(tmp_path: Path):
@@ -85,3 +87,48 @@ def test_kaggle_export_can_strip_search_wrapper_explicitly(tmp_path: Path):
 
     assert SEARCH_WRAPPER_MARKER not in main_py
     assert "def _gt_search_action" not in main_py
+
+
+def test_deck_override_writes_exact_legal_deck(tmp_path: Path):
+    deck_override = [1] * 56 + [1121] * 4
+    cfg = BuildConfig(
+        name="override_exact",
+        base=Path("outputs/reference_submissions/i-have-one-rear-card.tar.gz"),
+        out=tmp_path / "override_exact.tar.gz",
+        injection="great_tusk",
+        deck_override=deck_override,
+        strategy_weights={"opp_mill": 1234.0},
+        policy_variant="test_variant",
+        origin="test",
+    )
+    build_submission(cfg)
+
+    deck = [int(line) for line in _read_member(cfg.out, "deck.csv").splitlines()]
+    metadata = _read_member(cfg.out, "build_metadata.json")
+
+    assert deck == deck_override
+    assert '"opp_mill": 1234.0' in metadata
+    assert '"policy_variant": "test_variant"' in metadata
+
+
+def test_search_wrapper_injection_is_idempotent(tmp_path: Path):
+    first = BuildConfig(
+        name="first_wrapper",
+        base=Path("outputs/reference_submissions/i-have-one-rear-card.tar.gz"),
+        out=tmp_path / "first.tar.gz",
+        injection="great_tusk",
+    )
+    build_submission(first)
+    second = BuildConfig(
+        name="second_wrapper",
+        base=first.out,
+        out=tmp_path / "second.tar.gz",
+        injection="great_tusk",
+        strategy_weights={"opp_mill": 999.0},
+    )
+    build_submission(second)
+
+    main_py = _read_member(second.out, "main.py")
+
+    assert main_py.count(SEARCH_WRAPPER_MARKER) == 1
+    assert "'opp_mill': 999.0" in main_py

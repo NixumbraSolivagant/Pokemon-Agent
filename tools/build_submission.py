@@ -62,7 +62,12 @@ class BuildConfig:
     search_margin: float = 1200.0
     search_rollout_steps: int = 16
     deck_swaps: list[tuple[int, int]] = field(default_factory=list)
+    deck_override: list[int] | None = None
     deck_files: tuple[str, ...] = ("deck.csv",)
+    strategy_weights: dict[str, float] = field(default_factory=dict)
+    policy_variant: str = "default"
+    opponent_model: str = "perfect"
+    origin: str = ""
     notes: str = ""
     include_build_metadata: bool = True
 
@@ -84,6 +89,16 @@ GT_SEARCH_CANDIDATES = __GT_SEARCH_CANDIDATES__
 GT_SEARCH_BUDGET_S = __GT_SEARCH_BUDGET_S__
 GT_SEARCH_MARGIN = __GT_SEARCH_MARGIN__
 GT_SEARCH_ROLLOUT_STEPS = __GT_SEARCH_ROLLOUT_STEPS__
+GT_STRATEGY_WEIGHTS = __GT_STRATEGY_WEIGHTS__
+GT_POLICY_VARIANT = "__GT_POLICY_VARIANT__"
+GT_OPPONENT_MODEL = "__GT_OPPONENT_MODEL__"
+
+
+def _gt_weight(name, default):
+    try:
+        return float(GT_STRATEGY_WEIGHTS.get(name, default))
+    except Exception:
+        return default
 
 
 def _gt_to_builtin(value):
@@ -128,27 +143,27 @@ def _gt_eval_state(obs, me_idx):
     value = 0.0
     opp_deck = getattr(opp, "deckCount", 60)
     my_deck = getattr(me, "deckCount", 60)
-    value += (len(getattr(opp, "prize", []) or []) - len(getattr(me, "prize", []) or [])) * 3500.0
-    value += (60 - opp_deck) * 950.0
-    value -= (60 - my_deck) * 280.0
+    value += (len(getattr(opp, "prize", []) or []) - len(getattr(me, "prize", []) or [])) * _gt_weight("prize_delta", 3500.0)
+    value += (60 - opp_deck) * _gt_weight("opp_mill", 950.0)
+    value -= (60 - my_deck) * _gt_weight("self_mill_penalty", 280.0)
     if opp_deck <= 4:
-        value += (5 - opp_deck) * 18000.0
+        value += (5 - opp_deck) * _gt_weight("opp_deckout_bonus", 18000.0)
     if my_deck <= 5:
-        value -= (6 - my_deck) * 12000.0
-    value += (getattr(me, "handCount", 0) - getattr(opp, "handCount", 0)) * 45.0
-    value += (my_deck - opp_deck) * 30.0
+        value -= (6 - my_deck) * _gt_weight("self_deckout_penalty", 12000.0)
+    value += (getattr(me, "handCount", 0) - getattr(opp, "handCount", 0)) * _gt_weight("hand_delta", 45.0)
+    value += (my_deck - opp_deck) * _gt_weight("deck_delta", 30.0)
 
     hand = list(getattr(me, "hand", []) or [])
     hand_ids = [getattr(card, "id", None) for card in hand]
     active = active_pokemon(me)
     if active is not None and active.id == GREAT_TUSK:
-        value += 1800.0
+        value += _gt_weight("great_tusk_active", 1800.0)
         if _gt_energy_count(active) >= 2:
-            value += 6500.0
+            value += _gt_weight("great_tusk_ready", 6500.0)
             if not getattr(st, "supporterPlayed", False) and EXPLORER_GUIDANCE in hand_ids:
-                value += 14000.0
+                value += _gt_weight("explorer_ready", 14000.0)
             if getattr(st, "supporterPlayed", False):
-                value += 4500.0
+                value += _gt_weight("supporter_played_attack", 4500.0)
     if EXPLORER_GUIDANCE in hand_ids:
         value += 3500.0
     if POKEGEAR_30 in hand_ids or POKE_PAD in hand_ids:
@@ -515,6 +530,13 @@ def load_config(path: Path | None) -> dict[str, Any]:
 def make_config(args: argparse.Namespace) -> BuildConfig:
     data = load_config(args.config)
     deck_swaps = [tuple(map(int, pair)) for pair in data.get("deck_swaps", [])]
+    deck_override = data.get("deck_override")
+    if deck_override is not None:
+        deck_override = [int(card_id) for card_id in deck_override]
+    strategy_weights = {
+        str(key): float(value)
+        for key, value in dict(data.get("strategy_weights", {})).items()
+    }
     return BuildConfig(
         name=str(data.get("name") or args.name),
         family=str(data.get("family", "great_tusk")),
@@ -527,7 +549,12 @@ def make_config(args: argparse.Namespace) -> BuildConfig:
         search_margin=float(data.get("search_margin", args.search_margin)),
         search_rollout_steps=int(data.get("search_rollout_steps", args.search_rollout_steps)),
         deck_swaps=deck_swaps,
+        deck_override=deck_override,
         deck_files=tuple(data.get("deck_files", ("deck.csv",))),
+        strategy_weights=strategy_weights,
+        policy_variant=str(data.get("policy_variant", "default")),
+        opponent_model=str(data.get("opponent_model", "perfect")),
+        origin=str(data.get("origin", "")),
         notes=str(data.get("notes", "")),
         include_build_metadata=bool(data.get("include_build_metadata", args.include_build_metadata)),
     )
@@ -536,17 +563,45 @@ def make_config(args: argparse.Namespace) -> BuildConfig:
 def build_main(original: str, cfg: BuildConfig) -> str:
     if cfg.injection == "none":
         return original.rstrip() + "\n"
+    marker = "# --- Champion Great Tusk search wrapper injected by tools.build_submission ---"
+    existing = original.find(marker)
+    if existing >= 0:
+        original = original[:existing].rstrip() + "\n"
     injection = (
         SEARCH_INJECTION.replace("__GT_SEARCH_ENABLED__", "True" if cfg.enable_search else "False")
         .replace("__GT_SEARCH_CANDIDATES__", str(cfg.search_candidates))
         .replace("__GT_SEARCH_BUDGET_S__", repr(cfg.search_budget_s))
         .replace("__GT_SEARCH_MARGIN__", repr(cfg.search_margin))
         .replace("__GT_SEARCH_ROLLOUT_STEPS__", str(cfg.search_rollout_steps))
+        .replace("__GT_STRATEGY_WEIGHTS__", repr(dict(cfg.strategy_weights)))
+        .replace("__GT_POLICY_VARIANT__", cfg.policy_variant.replace("\\", "\\\\").replace('"', '\\"'))
+        .replace("__GT_OPPONENT_MODEL__", cfg.opponent_model.replace("\\", "\\\\").replace('"', '\\"'))
     )
     return original.rstrip() + "\n" + injection.lstrip()
 
 
-def apply_deck_swaps(deck_text: str, swaps: list[tuple[int, int]]) -> str:
+def validate_deck_ids(deck: list[int]) -> None:
+    counts = Counter(deck)
+    if len(deck) != 60:
+        raise ValueError(f"Deck must contain 60 cards, got {len(deck)}")
+    if any(card_id <= 0 for card_id in deck):
+        raise ValueError("Deck card ids must be positive ints")
+    over_limit = [card_id for card_id, count in counts.items() if card_id not in BASIC_ENERGY_IDS and count > 4]
+    if over_limit:
+        raise ValueError(f"Non-basic cards exceed four-copy limit: {sorted(over_limit)}")
+    ace_specs = [card_id for card_id in deck if card_id in ACE_SPEC_IDS]
+    if len(ace_specs) > 1:
+        raise ValueError(f"Deck cannot contain more than one ACE SPEC card: {sorted(ace_specs)}")
+
+
+def deck_to_text(deck: list[int]) -> str:
+    validate_deck_ids(deck)
+    return "\n".join(str(card_id) for card_id in deck) + "\n"
+
+
+def apply_deck_swaps(deck_text: str, swaps: list[tuple[int, int]], override: list[int] | None = None) -> str:
+    if override is not None:
+        return deck_to_text(list(override))
     deck = [int(line) for line in deck_text.splitlines() if line.strip()]
     counts = Counter(deck)
     for add_id, remove_id in swaps:
@@ -559,12 +614,7 @@ def apply_deck_swaps(deck_text: str, swaps: list[tuple[int, int]]) -> str:
     out: list[int] = []
     for card_id, count in counts.items():
         out.extend([card_id] * count)
-    if len(out) != 60:
-        raise ValueError(f"Deck must contain 60 cards, got {len(out)}")
-    ace_specs = [card_id for card_id in out if card_id in ACE_SPEC_IDS]
-    if len(ace_specs) > 1:
-        raise ValueError(f"Deck cannot contain more than one ACE SPEC card: {sorted(ace_specs)}")
-    return "\n".join(str(card_id) for card_id in out) + "\n"
+    return deck_to_text(out)
 
 
 def build_submission(cfg: BuildConfig) -> Path:
@@ -580,7 +630,12 @@ def build_submission(cfg: BuildConfig) -> Path:
         "search_margin": cfg.search_margin,
         "search_rollout_steps": cfg.search_rollout_steps,
         "deck_swaps": cfg.deck_swaps,
+        "deck_override": cfg.deck_override,
         "deck_files": list(cfg.deck_files),
+        "strategy_weights": cfg.strategy_weights,
+        "policy_variant": cfg.policy_variant,
+        "opponent_model": cfg.opponent_model,
+        "origin": cfg.origin,
         "notes": cfg.notes,
     }
     with tarfile.open(cfg.base, "r:gz") as src, tarfile.open(cfg.out, "w:gz") as dst:
@@ -594,7 +649,7 @@ def build_submission(cfg: BuildConfig) -> Path:
             if member.name == "main.py":
                 data = build_main(data.decode("utf-8"), cfg).encode("utf-8")
             elif member.name in cfg.deck_files:
-                data = apply_deck_swaps(data.decode("utf-8"), cfg.deck_swaps).encode("utf-8")
+                data = apply_deck_swaps(data.decode("utf-8"), cfg.deck_swaps, cfg.deck_override).encode("utf-8")
             info = copy.copy(member)
             info.size = len(data)
             dst.addfile(info, io.BytesIO(data))

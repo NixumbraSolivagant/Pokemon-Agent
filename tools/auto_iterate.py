@@ -33,6 +33,13 @@ def config_to_dict(cfg: BuildConfig) -> dict[str, Any]:
 
 
 def config_from_dict(data: dict[str, Any]) -> BuildConfig:
+    deck_override = data.get("deck_override")
+    if deck_override is not None:
+        deck_override = [int(card_id) for card_id in deck_override]
+    strategy_weights = {
+        str(key): float(value)
+        for key, value in dict(data.get("strategy_weights", {})).items()
+    }
     return BuildConfig(
         name=str(data.get("name", "champion")),
         family=str(data.get("family", "great_tusk")),
@@ -45,7 +52,12 @@ def config_from_dict(data: dict[str, Any]) -> BuildConfig:
         search_margin=float(data.get("search_margin", 1200.0)),
         search_rollout_steps=int(data.get("search_rollout_steps", 16)),
         deck_swaps=[tuple(map(int, pair)) for pair in data.get("deck_swaps", [])],
+        deck_override=deck_override,
         deck_files=tuple(data.get("deck_files", ("deck.csv",))),
+        strategy_weights=strategy_weights,
+        policy_variant=str(data.get("policy_variant", "default")),
+        opponent_model=str(data.get("opponent_model", "perfect")),
+        origin=str(data.get("origin", "")),
         notes=str(data.get("notes", "")),
     )
 
