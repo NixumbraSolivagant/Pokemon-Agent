@@ -12,6 +12,7 @@ from tools.discovery_engine import (
     build_generation_feedback,
     candidate_generation_summary,
     classify_final,
+    evaluation_pools,
     pool_paths_by_role,
     profile_from_name,
     resolve_feedback_target_paths,
@@ -45,8 +46,28 @@ def test_turbo_discovery_profile_uses_auto_workers_and_larger_population():
     assert turbo.stage_b.candidate_limit > normal.stage_b.candidate_limit
     assert turbo.stage_c.games_per_pair == 64
     assert turbo.stage_c.record_mode == "sample"
-    assert turbo.stage_d.games_per_pair == 256
+    assert turbo.stage_d.games_per_pair == 512
     assert turbo.stage_d.record_mode == "sample"
+
+
+def test_evaluation_pools_always_include_incumbent(tmp_path: Path):
+    incumbent = tmp_path / "incumbent.tar.gz"
+    core = tmp_path / "core.tar.gz"
+    holdout = tmp_path / "holdout.tar.gz"
+    counter = tmp_path / "counter.tar.gz"
+    for index, path in enumerate((incumbent, core, holdout, counter)):
+        path.write_text(str(index), encoding="utf-8")
+
+    discovery, final_holdout = evaluation_pools(
+        {"incumbent": [incumbent], "core": [core], "holdout": [holdout]},
+        [counter],
+    )
+
+    assert incumbent.resolve() in discovery
+    assert incumbent.resolve() in final_holdout
+    assert counter.resolve() in discovery
+    assert counter.resolve() not in final_holdout
+    assert discovery[:2] == [incumbent.resolve(), counter.resolve()]
 
 
 def test_reference_pool_includes_submission_820_and_baselines():

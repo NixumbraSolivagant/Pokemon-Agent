@@ -105,7 +105,7 @@ def profile_from_name(name: str) -> DiscoveryProfile:
             stage_a=Stage("stage_a", 4, 96, 8, "none", 32),
             stage_b=Stage("stage_b", 16, 32, 8, "sample", 12),
             stage_c=Stage("stage_c_confirm", 64, 12, 10, "sample", 6),
-            stage_d=Stage("stage_d_holdout", 256, 4, 12, "sample", 4),
+            stage_d=Stage("stage_d_holdout", 512, 4, 12, "sample", 4),
             manual_slots=8,
             max_no_result_rate=0.01,
             min_holdout_score_delta=8.0,
@@ -122,10 +122,10 @@ def profile_from_name(name: str) -> DiscoveryProfile:
         workers=0,
         max_actions=1000,
         run_timeout_s=180.0,
-            stage_a=Stage("stage_a", 4, 96, 10, "none", 32),
-            stage_b=Stage("stage_b", 16, 40, 10, "sample", 12),
-            stage_c=Stage("stage_c_confirm", 64, 12, 12, "sample", 6),
-            stage_d=Stage("stage_d_holdout", 256, 4, 14, "sample", 4),
+        stage_a=Stage("stage_a", 4, 96, 10, "none", 32),
+        stage_b=Stage("stage_b", 16, 40, 10, "sample", 12),
+        stage_c=Stage("stage_c_confirm", 64, 12, 12, "sample", 6),
+        stage_d=Stage("stage_d_holdout", 512, 4, 14, "sample", 4),
         manual_slots=10,
         max_no_result_rate=0.01,
         min_holdout_score_delta=8.0,
@@ -762,6 +762,20 @@ def pool_paths_by_role(manifest: dict[str, Any]) -> dict[str, list[Path]]:
     return roles
 
 
+def evaluation_pools(
+    pools: dict[str, list[Path]],
+    counter_opponents: list[Path],
+) -> tuple[list[Path], list[Path]]:
+    incumbent = pools.get("incumbent", [])
+    discovery = unique_existing(
+        [*incumbent, *counter_opponents, *pools.get("core", []), *pools.get("hof", [])]
+    )
+    holdout = unique_existing(
+        [*incumbent, *pools.get("holdout", []), *pools.get("core", []), *pools.get("hof", [])]
+    )
+    return discovery, holdout
+
+
 def run_scenario_gate(
     records: list[CandidateRecord],
     names: list[str],
@@ -872,7 +886,7 @@ def eval_stage(
         max_actions=args.max_actions or profile.max_actions,
         run_timeout_s=args.run_timeout or profile.run_timeout_s,
         record_mode=stage.record_mode,
-        record_sample_rate=args.record_sample_rate,
+        record_sample_rate=max(args.record_sample_rate, 0.05) if "holdout" in stage.name else args.record_sample_rate,
         record_gzip=True,
         progress=args.progress,
         progress_label=stage.name,
@@ -886,7 +900,7 @@ def eval_stage(
         stage.games_per_pair,
         cfg,
         Path.cwd(),
-        peer_span=0 if "holdout" in stage.name else 1,
+        peer_span=max(0, len(candidate_tarballs) - 1) if "holdout" in stage.name else 1,
     )
     save_report(report, out_dir / stage.name)
     write_psro(report, out_dir / stage.name / "psro.json", [r.name for r in selected_records])
@@ -1054,10 +1068,10 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
     all_names = [record.name for record in records]
     pool_manifest = write_pool_manifest(gen_dir / "pool_manifest.json", incumbent_tarball, unique_existing(args.pool), hof_paths, profile.stage_d.pool_limit)
     pools = pool_paths_by_role(pool_manifest)
-    discovery_pool = unique_existing(
-        [*pools.get("core", []), *pools.get("hof", []), *(Path(record.eval_tarball) for record in opponent_records)]
+    discovery_pool, holdout_pool = evaluation_pools(
+        pools,
+        [Path(record.eval_tarball) for record in opponent_records],
     )
-    holdout_pool = unique_existing([*pools.get("holdout", []), *pools.get("core", []), *pools.get("hof", [])])
 
     set_run_phase(state, args.out, generation, profile.stage_a.name, "running Stage A ladder")
     report_a, names_a = eval_stage(records, all_names, discovery_pool, gen_dir, profile.stage_a, profile, args, generation * 10000 + 101, incumbent_name)

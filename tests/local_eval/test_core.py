@@ -276,3 +276,11 @@ def test_candidate_pool_schedule_excludes_opponent_self_play():
     assert sum(first < 4 <= second for first, second in pairs) == 12
     assert sum(first < 4 and second < 4 for first, second in pairs) == 4
     assert not any(first >= 4 and second >= 4 for first, second in pairs)
+
+
+def test_candidate_pool_schedule_can_fully_compare_finalists():
+    pairs = candidate_pool_schedule(candidate_count=4, opponent_count=3, peer_span=3)
+
+    assert sum(first < 4 <= second for first, second in pairs) == 12
+    assert sum(first < 4 and second < 4 for first, second in pairs) == 6
+    assert len(pairs) == 18

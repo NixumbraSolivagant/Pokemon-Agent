@@ -67,7 +67,9 @@ Discovery evaluation uses a scheduled candidate-pool graph rather than a full
 round robin. Every candidate plays the selected baseline/counter-opponent pool,
 plus a sparse ring of candidate peers. Baselines never play other baselines and
 counter opponents never play one another. Confirmation stages sample traces
-instead of recording every decisive loss.
+instead of recording every decisive loss. The incumbent is mandatory in both
+discovery and holdout pools. Stage D restores 512 games per matchup, fully
+cross-checks the four finalists, and samples at least 5% of traces.
 
 ## Validation
 
