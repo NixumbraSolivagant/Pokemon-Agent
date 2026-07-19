@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from local_eval.models import MatchReport
@@ -14,6 +14,9 @@ class PsroResult:
     weights: dict[str, float]
     exploitability_proxy: float
     niches: list[dict[str, object]]
+    best_response_targets: list[str] = field(default_factory=list)
+    counter_opponent_targets: list[str] = field(default_factory=list)
+    uncertain_matchups: list[dict[str, object]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -22,6 +25,9 @@ class PsroResult:
             "weights": self.weights,
             "exploitability_proxy": self.exploitability_proxy,
             "niches": self.niches,
+            "best_response_targets": self.best_response_targets,
+            "counter_opponent_targets": self.counter_opponent_targets,
+            "uncertain_matchups": self.uncertain_matchups,
         }
 
 
@@ -84,6 +90,8 @@ def solve_psro(report: MatchReport, names: list[str] | None = None, iterations: 
     exploitability = max(weighted_payoffs) - value if weighted_payoffs else 0.0
     weights_by_name = {name: weights[i] for i, name in enumerate(names) if weights[i] >= 0.001}
     niches: list[dict[str, object]] = []
+    uncertain: list[dict[str, object]] = []
+    stats_by_name = {stats.name: stats for stats in report.standings}
     for i, name in enumerate(names):
         weight = weights_by_name.get(name, 0.0)
         if weight < 0.001:
@@ -111,12 +119,35 @@ def solve_psro(report: MatchReport, names: list[str] | None = None, iterations: 
                 "loses_to": [opponent for _, opponent in loses_to],
             }
         )
+        for j in range(i + 1, len(names)):
+            rec = stats_by_name[name].opponents.get(names[j], {"wins": 0, "losses": 0, "draws": 0})
+            games = rec["wins"] + rec["losses"] + rec["draws"]
+            score_rate = (rec["wins"] + 0.5 * rec["draws"]) / max(1, games)
+            uncertainty = (score_rate * (1.0 - score_rate) / max(1, games)) ** 0.5
+            uncertain.append(
+                {
+                    "first": name,
+                    "second": names[j],
+                    "games": games,
+                    "score_rate": score_rate,
+                    "uncertainty": uncertainty,
+                }
+            )
+    uncertain.sort(key=lambda row: (row["uncertainty"], -row["games"]), reverse=True)
+    meta_ranked = sorted(weights_by_name, key=weights_by_name.get, reverse=True)
+    vulnerable = sorted(
+        names,
+        key=lambda candidate: min(matrix[names.index(candidate)]) if len(names) > 1 else 0.0,
+    )
     return PsroResult(
         names=names,
         payoff=matrix,
         weights=weights_by_name,
         exploitability_proxy=exploitability,
         niches=niches,
+        best_response_targets=meta_ranked[: max(1, min(4, len(meta_ranked)))],
+        counter_opponent_targets=vulnerable[: max(1, min(4, len(vulnerable)))],
+        uncertain_matchups=uncertain[:12],
     )
 
 

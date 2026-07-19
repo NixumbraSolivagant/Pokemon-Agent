@@ -839,49 +839,43 @@ def generate_discovery_configs(
 ) -> list[BuildConfig]:
     rng = random.Random(seed + generation * 1009)
     out_dir.mkdir(parents=True, exist_ok=True)
-    hof_paths = [path for path in (hof_paths or []) if path.exists()]
-    target_paths = [path for path in (target_paths or []) if path.exists()]
-    incumbent = incumbent_from_tarball(incumbent_tarball, out_dir)
-    incumbent = replace(incumbent, name=f"d{generation:03d}_incumbent", out=out_dir / f"d{generation:03d}_incumbent.tar.gz")
-
-    seed_decks = seed_decks_from_paths([incumbent_tarball, *hof_paths, *target_paths])
-    configs: list[BuildConfig] = [incumbent]
+    configs: list[BuildConfig] = []
     pressure_motifs = motifs_from_feedback(feedback_path)
     has_feedback = bool(pressure_motifs or read_feedback(feedback_path).get("pressure_items"))
-    pressure_budget = max(0, int(population * 0.70)) if has_feedback else 0
-    if pressure_budget:
-        configs.extend(motif_configs(incumbent, generation, out_dir, pressure_motifs, seed_decks, max(4, pressure_budget // 2), rng))
-        configs.extend(motif_combo_configs(incumbent, generation, out_dir, pressure_motifs, seed_decks, max(4, pressure_budget // 5), rng))
-        configs.extend(pressure_strategy_configs(incumbent, generation, out_dir, feedback_path, max(3, pressure_budget // 4)))
-        configs.extend(pressure_opponent_model_configs(incumbent, generation, out_dir, feedback_path, max(1, pressure_budget // 12)))
-        configs.extend(opponent_search_matrix_configs(incumbent, generation, out_dir, max(6, pressure_budget // 8)))
-    if pressure_only and has_feedback:
-        configs.extend(tag_combo_configs(incumbent, generation, out_dir, max(8, population // 3), rng))
-        configs.extend(search_strategy_matrix_configs(incumbent, generation, out_dir, max(12, population // 2)))
-        configs.extend(opponent_search_matrix_configs(incumbent, generation, out_dir, max(8, population // 4)))
-    if not pressure_only and loss_digest_path is not None:
-        digest_motifs = motifs_from_loss_digest(loss_digest_path)
-        configs.extend(motif_configs(incumbent, generation, out_dir, digest_motifs, seed_decks, max(2, population // 10), rng))
-
-    legacy_budget = min(max(4, population // 8), max(0, population - len(configs)))
-    legacy_configs: list[BuildConfig] = []
-    if not pressure_only:
-        legacy_configs.extend(search_strategy_matrix_configs(incumbent, generation, out_dir, max(12, legacy_budget)))
-        legacy_configs.extend(opponent_search_matrix_configs(incumbent, generation, out_dir, max(8, legacy_budget // 2)))
-        if include_portfolio:
-            legacy_configs.extend(metal_prior_configs(generation, out_dir, max(4, legacy_budget // 2)))
-
-    synthetic_population = max(0, population - len(configs) - legacy_budget)
+    # New discovery is deliberately independent from incumbent decks and code.
+    # Feedback only changes mutation pressure; it never supplies a parent tarball.
+    base = BuildConfig(
+        name=f"d{generation:03d}_canonical_seed",
+        out=out_dir / f"d{generation:03d}_canonical_seed.tar.gz",
+        enable_search=True,
+        injection="great_tusk",
+        origin="canonical_runtime",
+    )
+    synthetic_population = population
     configs.extend(
         generate_synthetic_configs(
-            incumbent,
+            base,
             out_dir,
             synthetic_population,
             seed + generation * 7919,
             feedback_path,
         )
     )
-    configs.extend(legacy_configs[:legacy_budget])
+    if has_feedback:
+        pressure_count = max(1, min(len(configs), population // 3))
+        pressure_shifts: dict[str, float] = {}
+        for item in read_feedback(feedback_path).get("pressure_items", []):
+            for key, value in dict(item.get("strategy_shifts", {})).items():
+                pressure_shifts[str(key)] = float(value)
+        for cfg in configs[:pressure_count]:
+            cfg.origin = "pressure:strategy_genome"
+            cfg.strategy_weights.update(pressure_shifts)
+            cfg.notes = f"Feedback-directed mutation; {cfg.notes}"
+    if loss_digest_path is not None and loss_digest_path.exists() and configs:
+        digest_count = max(1, min(len(configs), population // 6))
+        for cfg in configs[-digest_count:]:
+            cfg.origin = "motif:loss_digest_strategy_genome"
+            cfg.notes = f"Loss-digest mutation; {cfg.notes}"
 
     unique: list[BuildConfig] = []
     seen_name: set[str] = set()

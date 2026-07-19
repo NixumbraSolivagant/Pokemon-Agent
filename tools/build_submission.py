@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import io
 import json
 import tarfile
@@ -598,24 +597,7 @@ def _read_deck_from_archive(path: Path) -> list[int]:
 
 
 def _resolved_opponent_decks(cfg: BuildConfig) -> dict[str, list[int]]:
-    if cfg.opponent_decks:
-        return {str(name): list(deck) for name, deck in cfg.opponent_decks.items() if deck}
-    paths = {
-        "great_tusk": Path("outputs/reference_submissions/i-have-one-rear-card.tar.gz"),
-        "advanced": Path("outputs/reference_submissions/pokemon-ai-battle-best-ptcg-advanced.tar.gz"),
-        "metal_tempo": Path("outputs/reference_submissions/pokemon-steel.tar.gz"),
-        "rahul_metal": Path("outputs/reference_submissions/pokemon-tcg-rahul-jiwane.tar.gz"),
-        "lucario": Path("outputs/reference_submissions/ptcg-mega-lucario-ex-v63.tar.gz"),
-        "probabilistic": Path("outputs/reference_submissions/improved-probabilistic-agent.tar.gz"),
-        "multiply_940": Path("outputs/reference_submissions/multiply-agent-best-940-lb.tar.gz"),
-    }
-    resolved = {name: deck for name, path in paths.items() if (deck := _read_deck_from_archive(path))}
-    if resolved:
-        return resolved
-    local_deck = Path("deck.csv")
-    if local_deck.exists():
-        return {"unknown": [int(line) for line in local_deck.read_text(encoding="utf-8").splitlines() if line.strip()]}
-    return {}
+    return {str(name): list(deck) for name, deck in cfg.opponent_decks.items() if deck}
 
 
 def make_config(args: argparse.Namespace) -> BuildConfig:
@@ -633,6 +615,8 @@ def make_config(args: argparse.Namespace) -> BuildConfig:
         family=str(data.get("family", "great_tusk")),
         base=Path(data.get("base") or args.base),
         out=Path(data.get("out") or args.out),
+        runtime_source=Path(data.get("runtime_source", "main.py")),
+        runtime_cg_dir=Path(data.get("runtime_cg_dir", "cg")),
         enable_search=bool(data.get("enable_search", args.enable_search)),
         injection=str(data.get("injection", args.injection)),
         search_candidates=int(data.get("search_candidates", args.search_candidates)),
@@ -682,10 +666,26 @@ def build_main(original: str, cfg: BuildConfig) -> str:
 
 def build_submission(cfg: BuildConfig) -> Path:
     cfg.out.parent.mkdir(parents=True, exist_ok=True)
+    if not cfg.runtime_source.is_file():
+        raise FileNotFoundError(f"Missing canonical runtime source: {cfg.runtime_source}")
+    if not cfg.runtime_cg_dir.is_dir():
+        raise FileNotFoundError(f"Missing canonical cg runtime: {cfg.runtime_cg_dir}")
+    deck = list(cfg.deck_override or _read_deck_from_archive(cfg.base))
+    if not deck:
+        deck_path = Path("deck.csv")
+        deck = [int(line) for line in deck_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if cfg.deck_swaps and cfg.deck_override is None:
+        deck = [int(line) for line in apply_deck_swaps(deck_to_text(deck), cfg.deck_swaps).splitlines()]
+    validate_deck_ids(deck)
+    main_data = build_main(cfg.runtime_source.read_text(encoding="utf-8"), cfg).encode("utf-8")
+    deck_data = deck_to_text(deck).encode("utf-8")
     metadata = {
         "name": cfg.name,
         "family": cfg.family,
         "base": str(cfg.base),
+        "runtime_source": str(cfg.runtime_source),
+        "runtime_cg_dir": str(cfg.runtime_cg_dir),
+        "reference_free_runtime": True,
         "enable_search": cfg.enable_search,
         "injection": cfg.injection,
         "search_candidates": cfg.search_candidates,
@@ -704,20 +704,17 @@ def build_submission(cfg: BuildConfig) -> Path:
         "origin": cfg.origin,
         "notes": cfg.notes,
     }
-    with tarfile.open(cfg.base, "r:gz") as src, tarfile.open(cfg.out, "w:gz") as dst:
-        for member in src.getmembers():
-            if not member.isfile():
+    with tarfile.open(cfg.out, "w:gz") as dst:
+        entries: list[tuple[str, bytes, int]] = [("main.py", main_data, 0o644)]
+        entries.extend((name, deck_data, 0o644) for name in dict.fromkeys(cfg.deck_files))
+        for path in sorted(cfg.runtime_cg_dir.rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
                 continue
-            payload = src.extractfile(member)
-            if payload is None:
-                continue
-            data = payload.read()
-            if member.name == "main.py":
-                data = build_main(data.decode("utf-8"), cfg).encode("utf-8")
-            elif member.name in cfg.deck_files:
-                data = apply_deck_swaps(data.decode("utf-8"), cfg.deck_swaps, cfg.deck_override).encode("utf-8")
-            info = copy.copy(member)
+            entries.append(((Path("cg") / path.relative_to(cfg.runtime_cg_dir)).as_posix(), path.read_bytes(), 0o644))
+        for name, data, mode in entries:
+            info = tarfile.TarInfo(name)
             info.size = len(data)
+            info.mode = mode
             dst.addfile(info, io.BytesIO(data))
         if cfg.include_build_metadata:
             meta = json.dumps(metadata, indent=2).encode("utf-8")

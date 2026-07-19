@@ -48,11 +48,20 @@ backward compatibility. New code should import them from their owning modules.
 
 ## Strategy Discovery
 
-Candidate generation is intentionally reference-light. `tools/policy_genome.py`
-creates legal role-based decks and route parameters, while
-`tools/counterexample_search.py` converts loss feedback into targeted bias. The
-reference pool remains an evaluation and packaging anchor; it is not the main
-parent population for normal discovery generations.
+Candidate generation is reference-free. `tools/build_submission.py` packages
+the repository's canonical `main.py` and `cg/` runtime instead of copying code
+from an incumbent archive. `tools/policy_genome.py` evolves complete legal deck
+families, policy parameters, crossover, mutations, and behavior niches.
+
+`tools/opponent_models.py` maintains a coevolving opponent archive. New counter
+opponents are built as executable submissions and participate in discovery
+stages, while reference submissions are restricted to external baseline and
+holdout evaluation.
+
+Stage selection uses sequential racing and robust matchup statistics. PSRO
+artifacts identify meta-strategy targets, vulnerable candidates, and uncertain
+matchups for the next generation. Final discovery exports distinct generalist,
+anti-fast-KO, and anti-control candidates when enough clean finalists exist.
 
 ## Validation
 

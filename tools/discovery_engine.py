@@ -21,7 +21,10 @@ from tools.discovery_space import generate_discovery_configs, read_build_metadat
 from tools.export_kaggle_submission import export_kaggle_submission
 from tools.gold_gate import classify_candidate as classify_gold_candidate
 from tools.loss_mining import digest_loss_files, digest_scenarios, load_scenarios as load_loss_scenarios, mine_losses
+from tools.opponent_models import OpponentArchive, generate_counter_opponents
+from tools.policy_genome import compile_opponent_genome
 from tools.psro import psro_bonus_names, write_psro
+from tools.racing import rank_for_racing, report_racing
 from tools.reference_pool import DEFAULT_REFERENCE_PATHS
 from tools.scenario_eval import run_scenarios
 
@@ -99,10 +102,10 @@ def profile_from_name(name: str) -> DiscoveryProfile:
             workers=0,
             max_actions=1000,
             run_timeout_s=180.0,
-            stage_a=Stage("stage_a", 2, 144, 8, "none", 36),
-            stage_b=Stage("stage_b", 24, 40, 8, "sample", 16),
-            stage_c=Stage("stage_c_confirm", 80, 18, 10, "losses", 8),
-            stage_d=Stage("stage_d_holdout", 500, 8, 12, "losses", 5),
+            stage_a=Stage("stage_a", 8, 96, 8, "none", 32),
+            stage_b=Stage("stage_b", 32, 32, 8, "sample", 12),
+            stage_c=Stage("stage_c_confirm", 128, 12, 10, "losses", 6),
+            stage_d=Stage("stage_d_holdout", 512, 4, 12, "losses", 4),
             manual_slots=8,
             max_no_result_rate=0.01,
             min_holdout_score_delta=8.0,
@@ -119,10 +122,10 @@ def profile_from_name(name: str) -> DiscoveryProfile:
         workers=0,
         max_actions=1000,
         run_timeout_s=180.0,
-        stage_a=Stage("stage_a", 2, 224, 10, "none", 56),
-        stage_b=Stage("stage_b", 32, 72, 10, "sample", 24),
-        stage_c=Stage("stage_c_confirm", 96, 28, 12, "losses", 10),
-        stage_d=Stage("stage_d_holdout", 500, 10, 14, "losses", 6),
+            stage_a=Stage("stage_a", 8, 96, 10, "none", 32),
+            stage_b=Stage("stage_b", 32, 40, 10, "sample", 12),
+            stage_c=Stage("stage_c_confirm", 128, 12, 12, "losses", 6),
+            stage_d=Stage("stage_d_holdout", 512, 4, 14, "losses", 4),
         manual_slots=10,
         max_no_result_rate=0.01,
         min_holdout_score_delta=8.0,
@@ -152,6 +155,8 @@ def config_to_dict(cfg: BuildConfig) -> dict[str, Any]:
     data = asdict(cfg)
     data["base"] = str(cfg.base)
     data["out"] = str(cfg.out)
+    data["runtime_source"] = str(cfg.runtime_source)
+    data["runtime_cg_dir"] = str(cfg.runtime_cg_dir)
     return data
 
 
@@ -823,19 +828,8 @@ def select_next_names(
         for stats in report.standings
         if stats.name in candidate_names and clean_stats(stats, profile.max_no_result_rate)
     ]
-    rows.sort(
-        key=lambda s: (
-            s.kaggle_score_estimate,
-            s.wins - s.losses,
-            s.wins,
-            -s.losses,
-        ),
-        reverse=True,
-    )
-    names: list[str] = []
-    for stats in rows[: max(1, stage.finalists)]:
-        if stats.name not in names:
-            names.append(stats.name)
+    rows.sort(key=lambda s: (s.kaggle_score_estimate, s.wins - s.losses, s.wins, -s.losses), reverse=True)
+    names: list[str] = rank_for_racing(report, candidate_names, max(1, stage.finalists), profile.max_no_result_rate)
     for name in psro_bonus_names(report, candidate_names, profile.psro_slots):
         if name not in names:
             names.append(name)
@@ -909,7 +903,14 @@ def export_candidate(record: CandidateRecord, promote: Path, submission_out: Pat
     }
 
 
-def export_manual(records: list[CandidateRecord], names: list[str], out_dir: Path, slots: int, strip_search_wrapper: bool) -> list[dict[str, Any]]:
+def export_manual(
+    records: list[CandidateRecord],
+    names: list[str],
+    out_dir: Path,
+    slots: int,
+    strip_search_wrapper: bool,
+    roles: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
     by_name = candidate_by_name(records)
     manual_dir = out_dir / "manual_candidates"
     manual_dir.mkdir(parents=True, exist_ok=True)
@@ -920,9 +921,10 @@ def export_manual(records: list[CandidateRecord], names: list[str], out_dir: Pat
         record = by_name.get(name)
         if record is None:
             continue
-        target = manual_dir / f"{len(out) + 1:02d}_{record.name}.tar.gz"
+        role = (roles or {}).get(record.name, "backup")
+        target = manual_dir / f"{role}_{record.name}.tar.gz"
         export_kaggle_submission(Path(record.internal_tarball), target, strip_search_wrapper=strip_search_wrapper)
-        out.append({"name": record.name, "family": record.family, "origin": record.origin, "tarball": str(target)})
+        out.append({"name": record.name, "family": record.family, "origin": record.origin, "role": role, "tarball": str(target)})
     return out
 
 
@@ -977,6 +979,18 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
         target_paths=target_paths,
         min_diversity_distance=args.min_diversity_distance,
     )
+    opponent_archive_path = args.out / "opponent_archive.json"
+    opponent_archive = OpponentArchive.load(opponent_archive_path)
+    counter_genomes = generate_counter_opponents(
+        count=max(6, min(16, requested_population // 8)),
+        seed=args.seed + generation * 3571,
+        parents=opponent_archive.genomes(),
+    )
+    for genome in counter_genomes:
+        opponent_archive.add(genome)
+    opponent_archive.save(opponent_archive_path)
+    opponent_base = BuildConfig(name="counter_runtime", origin="coevolved_opponent")
+    opponent_configs = [compile_opponent_genome(genome, opponent_base, gen_dir / "opponent_variants") for genome in counter_genomes]
     generation_summary = candidate_generation_summary(configs, requested_population)
     write_json(gen_dir / "candidate_generation.json", generation_summary)
     if generation_summary["underfilled"]:
@@ -1006,13 +1020,35 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
     )
     if not records:
         raise RuntimeError("No candidates built")
+    opponent_records = build_records(
+        opponent_configs,
+        gen_dir / "opponent_eval_variants",
+        args.strip_search_wrapper,
+        build_workers=resolve_build_workers(args, profile),
+        progress=args.progress,
+        progress_label=f"generation_{generation:03d}_opponents",
+        progress_interval_s=args.progress_interval,
+        progress_mode=args.progress_mode,
+        progress_file=gen_dir / "opponent_progress.txt",
+        failures_out=gen_dir / "opponent_build_failures.json",
+    )
+    write_json(
+        gen_dir / "opponent_manifest.json",
+        {
+            "generated": [genome.to_dict() for genome in counter_genomes],
+            "built": [asdict(record) for record in opponent_records],
+            "archive": str(opponent_archive_path),
+        },
+    )
     generation_summary = candidate_generation_summary(configs, requested_population, len(records))
     write_json(gen_dir / "candidate_generation.json", generation_summary)
     incumbent_name = f"d{generation:03d}_incumbent"
     all_names = [record.name for record in records]
     pool_manifest = write_pool_manifest(gen_dir / "pool_manifest.json", incumbent_tarball, unique_existing(args.pool), hof_paths, profile.stage_d.pool_limit)
     pools = pool_paths_by_role(pool_manifest)
-    discovery_pool = unique_existing([*pools.get("core", []), *pools.get("hof", [])])
+    discovery_pool = unique_existing(
+        [*pools.get("core", []), *pools.get("hof", []), *(Path(record.eval_tarball) for record in opponent_records)]
+    )
     holdout_pool = unique_existing([*pools.get("holdout", []), *pools.get("core", []), *pools.get("hof", [])])
 
     set_run_phase(state, args.out, generation, profile.stage_a.name, "running Stage A ladder")
@@ -1151,7 +1187,11 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
     stats = stats_by_name(report_d)
     by_name = candidate_by_name(records)
     clean_names = [name for name in names_d if name in stats and clean_stats(stats[name], profile.max_no_result_rate)]
-    clean_names.sort(key=lambda name: (stats[name].kaggle_score_estimate, stats[name].wins - stats[name].losses), reverse=True)
+    racing = report_racing(report_d, clean_names)
+    roles = dict(racing.get("roles") or {})
+    clean_names = [name for name in racing.get("ranked", []) if name in clean_names]
+    write_json(gen_dir / "racing_report.json", racing)
+    write_json(gen_dir / "robustness_report.json", racing)
     if not clean_names:
         final = {"status": "failed", "reason": "no clean holdout finalists", "stage_d_top": names_d}
     else:
@@ -1165,7 +1205,11 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
             incumbent_name not in stats
             or (delta >= args.min_holdout_score_delta if args.min_holdout_score_delta is not None else profile.min_holdout_score_delta)
         ) and (incumbent_name not in stats or h2h_wins >= h2h_losses)
-        manual_names = [name for name in clean_names if name != incumbent_name]
+        role_order = {"generalist": 0, "anti_fast_ko": 1, "anti_control": 2}
+        manual_names = sorted(
+            [name for name in clean_names if name != incumbent_name],
+            key=lambda name: (role_order.get(roles.get(name, "backup"), 9), clean_names.index(name)),
+        )
         if strict_ok:
             final = export_candidate(by_name[best_name], args.promote, args.submission_out, args.strip_search_wrapper)
             final.update({"status": "promoted", "score_delta_vs_incumbent": delta, "h2h_wins": h2h_wins, "h2h_losses": h2h_losses})
@@ -1195,12 +1239,22 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
             gen_dir,
             args.manual_slots if args.manual_slots is not None else profile.manual_slots,
             args.strip_search_wrapper,
+            roles,
         )
         final["stage_d_top"] = [
             stats[name].to_dict()
             for name in clean_names
             if name in stats
         ]
+        write_json(
+            gen_dir / "candidate_manifest.json",
+            {
+                "generation": generation,
+                "candidates": final["manual_candidates"],
+                "roles": roles,
+                "reference_free_runtime": True,
+            },
+        )
 
     record_dirs = [gen_dir / profile.stage_c.name / "game_records", gen_dir / profile.stage_d.name / "game_records"]
     scenario_out = gen_dir / "scenarios.json"
@@ -1213,6 +1267,10 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
         max_trigger_turn=args.scenario_max_trigger_turn,
         min_drop=args.scenario_min_drop,
     )
+    write_json(gen_dir / "failure_scenarios.json", [scenario.to_dict() for scenario in scenarios])
+    psro_path = gen_dir / profile.stage_d.name / "psro.json"
+    if psro_path.exists():
+        write_json(gen_dir / "matchup_matrix.json", read_json(psro_path))
     loss_digest = digest_scenarios([scenario.to_dict() for scenario in scenarios], gen_dir / "loss_digest.json")
     training_scenarios = [*load_loss_scenarios(stage_b_scenarios), *load_loss_scenarios(stage_c_scenarios)]
     if getattr(args, "holdout_feedback_mode", "audit_only") == "weak_signal":

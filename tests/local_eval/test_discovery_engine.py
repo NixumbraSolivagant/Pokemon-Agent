@@ -274,7 +274,7 @@ def test_turbo_population_reaches_requested_size_with_diversity_filter(tmp_path:
     assert len(configs) == 96
     assert summary["underfilled"] is False
     assert summary["deck_overrides"] >= 32
-    assert "search_strategy_matrix" in summary["origin_counts"]
+    assert "synthetic_policy_genome" in summary["origin_counts"]
 
 
 def test_pressure_only_microburst_can_fill_requested_slots(tmp_path: Path):

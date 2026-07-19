@@ -6,6 +6,8 @@ from pathlib import Path
 
 DEFAULT_BASE = Path("outputs/reference_submissions/i-have-one-rear-card.tar.gz")
 DEFAULT_OUT = Path("outputs/submissions/champion_gt_search.tar.gz")
+DEFAULT_RUNTIME_SOURCE = Path("main.py")
+DEFAULT_RUNTIME_CG_DIR = Path("cg")
 
 
 @dataclass(slots=True)
@@ -14,6 +16,8 @@ class BuildConfig:
     family: str = "great_tusk"
     base: Path = DEFAULT_BASE
     out: Path = DEFAULT_OUT
+    runtime_source: Path = DEFAULT_RUNTIME_SOURCE
+    runtime_cg_dir: Path = DEFAULT_RUNTIME_CG_DIR
     enable_search: bool = True
     injection: str = "great_tusk"
     search_candidates: int = 8

@@ -24,6 +24,8 @@ def config_to_dict(cfg: BuildConfig) -> dict[str, Any]:
     data = asdict(cfg)
     data["base"] = str(cfg.base)
     data["out"] = str(cfg.out)
+    data["runtime_source"] = str(cfg.runtime_source)
+    data["runtime_cg_dir"] = str(cfg.runtime_cg_dir)
     return data
 
 
@@ -40,6 +42,8 @@ def config_from_dict(data: dict[str, Any]) -> BuildConfig:
         family=str(data.get("family", "great_tusk")),
         base=Path(data.get("base", DEFAULT_BASE)),
         out=Path(data.get("out", "outputs/submissions/champion_latest.tar.gz")),
+        runtime_source=Path(data.get("runtime_source", "main.py")),
+        runtime_cg_dir=Path(data.get("runtime_cg_dir", "cg")),
         enable_search=bool(data.get("enable_search", True)),
         injection=str(data.get("injection", "great_tusk")),
         search_candidates=int(data.get("search_candidates", 8)),
