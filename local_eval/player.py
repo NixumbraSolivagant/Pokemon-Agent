@@ -75,6 +75,7 @@ class PlayerProcess:
     project_root: Path
     timeout_s: float
     import_timeout_s: float = 6.0
+    log_dir: Path | None = None
     process: subprocess.Popen[str] | None = None
     stderr_path: Path | None = None
     stderr_handle: Any | None = None
@@ -83,7 +84,9 @@ class PlayerProcess:
         env = os.environ.copy()
         existing = env.get("PYTHONPATH")
         env["PYTHONPATH"] = str(self.project_root) if not existing else f"{self.project_root}{os.pathsep}{existing}"
-        self.stderr_path = self.submission_dir / f".local_eval_{self.name}_stderr.log"
+        stderr_dir = self.log_dir or self.submission_dir
+        stderr_dir.mkdir(parents=True, exist_ok=True)
+        self.stderr_path = stderr_dir / f".local_eval_{self.name}_stderr.log"
         self.stderr_handle = self.stderr_path.open("w+", encoding="utf-8")
         self.process = subprocess.Popen(
             [sys.executable, "-m", "local_eval.player", "--submission-dir", str(self.submission_dir)],

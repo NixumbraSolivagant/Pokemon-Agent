@@ -18,6 +18,8 @@ from tools.discovery_engine import (
     resolve_feedback_target_paths,
     resolve_build_workers,
     resolve_workers,
+    select_stage_opponents,
+    Stage,
     write_pool_manifest,
 )
 from tools.discovery_feedback import aggregate_feedback
@@ -42,7 +44,8 @@ def test_turbo_discovery_profile_uses_auto_workers_and_larger_population():
 
     assert normal.workers == 0
     assert turbo.workers == 0
-    assert turbo.population > normal.population
+    assert turbo.population == 144
+    assert turbo.stage_a.candidate_limit == 144
     assert turbo.stage_b.candidate_limit > normal.stage_b.candidate_limit
     assert turbo.stage_c.games_per_pair == 64
     assert turbo.stage_c.record_mode == "sample"
@@ -457,13 +460,49 @@ def test_gold_gate_requires_strong_anchor_progress(tmp_path: Path):
                     "multiply-agent-best-940-lb": {"wins": 57, "losses": 43, "draws": 0},
                     "submission_sorce_700": {"wins": 72, "losses": 28, "draws": 0},
                 },
-            }
+            },
+            {
+                "name": "incumbent",
+                "games": 100,
+                "wins": 40,
+                "losses": 60,
+                "draws": 0,
+                "no_results": 0,
+                "crashes": 0,
+                "timeouts": 0,
+                "invalids": 0,
+                "kaggle_score_estimate": 500.0,
+                "opponents": {"candidate": {"wins": 40, "losses": 60, "draws": 0}},
+            },
         ]
     }
     decision = classify_gold_candidate(report, "candidate", incumbent_name="incumbent", submission_sha256="")
     assert decision["decision"] == "kaggle_probe_ready"
     assert decision["submit_ready"] is False
     assert decision["gold_gate_passed"] is True
+
+
+def test_stage_pool_uses_role_quotas_instead_of_prefix_order(tmp_path: Path):
+    names = [
+        "incumbent",
+        *[f"counter_{index:04d}" for index in range(8)],
+        "i-have-one-rear-card",
+        "submission_820",
+        "pokemon-ai-battle-best-ptcg-advanced",
+        "multiply-agent-best-940-lb",
+        "extra-core",
+        "extra-hof",
+    ]
+    paths = []
+    for index, name in enumerate(names):
+        path = tmp_path / f"{name}.tar.gz"
+        path.write_bytes(f"archive-{index}".encode("ascii"))
+        paths.append(path)
+    selected = select_stage_opponents(paths, Stage("stage_a", 4, 144, 10, "none", 48), paths[0])
+    selected_names = {path.name.removesuffix(".tar.gz") for path in selected}
+    assert len(selected) == 10
+    assert {"incumbent", "i-have-one-rear-card", "submission_820", "pokemon-ai-battle-best-ptcg-advanced", "multiply-agent-best-940-lb"} <= selected_names
+    assert len([name for name in selected_names if name.startswith("counter_")]) == 3
 
 
 def test_gold_gate_fails_without_required_anchor_matchups():

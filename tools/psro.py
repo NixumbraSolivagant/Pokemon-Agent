@@ -10,10 +10,11 @@ from local_eval.models import MatchReport
 @dataclass(slots=True)
 class PsroResult:
     names: list[str]
-    payoff: list[list[float]]
+    payoff: list[list[float | None]]
     weights: dict[str, float]
     exploitability_proxy: float
     niches: list[dict[str, object]]
+    coverage: float = 0.0
     best_response_targets: list[str] = field(default_factory=list)
     counter_opponent_targets: list[str] = field(default_factory=list)
     uncertain_matchups: list[dict[str, object]] = field(default_factory=list)
@@ -25,21 +26,22 @@ class PsroResult:
             "weights": self.weights,
             "exploitability_proxy": self.exploitability_proxy,
             "niches": self.niches,
+            "coverage": self.coverage,
             "best_response_targets": self.best_response_targets,
             "counter_opponent_targets": self.counter_opponent_targets,
             "uncertain_matchups": self.uncertain_matchups,
         }
 
 
-def payoff_matrix(report: MatchReport, names: list[str] | None = None) -> tuple[list[str], list[list[float]]]:
+def payoff_matrix(report: MatchReport, names: list[str] | None = None) -> tuple[list[str], list[list[float | None]]]:
     by_name = {stats.name: stats for stats in report.standings}
     if names is None:
         names = [stats.name for stats in report.standings]
     names = [name for name in names if name in by_name]
-    matrix: list[list[float]] = []
+    matrix: list[list[float | None]] = []
     for row_name in names:
         stats = by_name[row_name]
-        row: list[float] = []
+        row: list[float | None] = []
         for col_name in names:
             if row_name == col_name:
                 row.append(0.0)
@@ -47,7 +49,7 @@ def payoff_matrix(report: MatchReport, names: list[str] | None = None) -> tuple[
             rec = stats.opponents.get(col_name, {"wins": 0, "losses": 0, "draws": 0})
             total = rec["wins"] + rec["losses"] + rec["draws"]
             if total <= 0:
-                row.append(0.0)
+                row.append(None)
             else:
                 score_rate = (rec["wins"] + 0.5 * rec["draws"]) / total
                 row.append(2.0 * score_rate - 1.0)
@@ -79,11 +81,30 @@ def replicator_dynamics(
 
 def solve_psro(report: MatchReport, names: list[str] | None = None, iterations: int = 2000) -> PsroResult:
     names, matrix = payoff_matrix(report, names)
-    weights = replicator_dynamics(matrix, iterations=iterations)
     if not names:
         return PsroResult([], [], {}, 0.0, [])
+    possible_pairs = len(names) * (len(names) - 1) // 2
+    covered_pairs = sum(1 for i in range(len(names)) for j in range(i + 1, len(names)) if matrix[i][j] is not None)
+    coverage = covered_pairs / possible_pairs if possible_pairs else 1.0
+    if coverage < 1.0:
+        return PsroResult(
+            names=names,
+            payoff=matrix,
+            weights={},
+            exploitability_proxy=0.0,
+            niches=[],
+            coverage=coverage,
+            uncertain_matchups=[
+                {"first": names[i], "second": names[j], "games": 0, "score_rate": None, "uncertainty": None}
+                for i in range(len(names))
+                for j in range(i + 1, len(names))
+                if matrix[i][j] is None
+            ][:12],
+        )
+    complete_matrix = [[float(value) for value in row] for row in matrix]
+    weights = replicator_dynamics(complete_matrix, iterations=iterations)
     weighted_payoffs = [
-        sum(matrix[i][j] * weights[j] for j in range(len(names)))
+        sum(complete_matrix[i][j] * weights[j] for j in range(len(names)))
         for i in range(len(names))
     ]
     value = sum(weights[i] * weighted_payoffs[i] for i in range(len(names)))
@@ -97,11 +118,11 @@ def solve_psro(report: MatchReport, names: list[str] | None = None, iterations: 
         if weight < 0.001:
             continue
         beats = sorted(
-            ((matrix[i][j], names[j]) for j in range(len(names)) if i != j and matrix[i][j] > 0.15),
+            ((complete_matrix[i][j], names[j]) for j in range(len(names)) if i != j and complete_matrix[i][j] > 0.15),
             reverse=True,
         )[:5]
         loses_to = sorted(
-            ((matrix[i][j], names[j]) for j in range(len(names)) if i != j and matrix[i][j] < -0.15),
+            ((complete_matrix[i][j], names[j]) for j in range(len(names)) if i != j and complete_matrix[i][j] < -0.15),
         )[:5]
         role = "generalist"
         if weight >= 0.20 and beats and loses_to:
@@ -137,7 +158,7 @@ def solve_psro(report: MatchReport, names: list[str] | None = None, iterations: 
     meta_ranked = sorted(weights_by_name, key=weights_by_name.get, reverse=True)
     vulnerable = sorted(
         names,
-        key=lambda candidate: min(matrix[names.index(candidate)]) if len(names) > 1 else 0.0,
+        key=lambda candidate: min(complete_matrix[names.index(candidate)]) if len(names) > 1 else 0.0,
     )
     return PsroResult(
         names=names,
@@ -145,6 +166,7 @@ def solve_psro(report: MatchReport, names: list[str] | None = None, iterations: 
         weights=weights_by_name,
         exploitability_proxy=exploitability,
         niches=niches,
+        coverage=coverage,
         best_response_targets=meta_ranked[: max(1, min(4, len(meta_ranked)))],
         counter_opponent_targets=vulnerable[: max(1, min(4, len(vulnerable)))],
         uncertain_matchups=uncertain[:12],

@@ -24,6 +24,12 @@ KEY_ANCHORS = {
     "multiply-agent-best-940-lb": 0.55,
     "submission_sorce_700": 0.70,
 }
+REQUIRED_GOLD_ANCHORS = (
+    "i-have-one-rear-card",
+    "submission_820",
+    "pokemon-ai-battle-best-ptcg-advanced",
+    "multiply-agent-best-940-lb",
+)
 
 
 @dataclass(slots=True)
@@ -148,17 +154,26 @@ def classify_candidate(
         if gate is None:
             continue
         gate.target = target
-        gate.passed = gate.games >= min_matchup_games and gate.win_rate >= target
+        wilson_target = max(0.0, target - 0.05)
+        gate.passed = gate.games >= min_matchup_games and gate.win_rate >= target and (
+            min_matchup_games <= 0 or gate.wilson_low >= wilson_target
+        )
         gates.append(gate)
         if gate.games < min_matchup_games:
             reasons.append(f"vs {opponent} only {gate.games} games; requires {min_matchup_games}")
         if not gate.passed:
             reasons.append(f"vs {opponent} win_rate {gate.win_rate:.3f} below {target:.3f}")
+        if min_matchup_games > 0 and gate.wilson_low < wilson_target:
+            reasons.append(f"vs {opponent} Wilson lower bound {gate.wilson_low:.3f} below {wilson_target:.3f}")
     covered = {gate.opponent for gate in gates}
-    for required in ("i-have-one-rear-card", "submission_820"):
+    for required in REQUIRED_GOLD_ANCHORS:
         if required not in covered:
             reasons.append(f"missing required anchor matchup: {required}")
-    if incumbent_name in stats and incumbent_name != candidate_name:
+    if incumbent_name == candidate_name:
+        reasons.append("candidate cannot be its own incumbent gate")
+    elif incumbent_name not in stats:
+        reasons.append(f"missing incumbent submission: {incumbent_name}")
+    else:
         gate = score_rate(row, incumbent_name)
         if gate is None:
             reasons.append(f"missing incumbent matchup: {incumbent_name}")

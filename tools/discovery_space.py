@@ -12,7 +12,7 @@ from typing import Any
 
 from tools.build_models import DEFAULT_BASE, BuildConfig
 from tools.deck_rules import ACE_SPEC_IDS, BASIC_ENERGY_IDS, validate_deck_ids
-from tools.policy_genome import generate_synthetic_configs
+from tools.policy_genome import StrategyGenome, generate_synthetic_configs
 from tools.prior_deck_space import (
     GT_PRIOR_PACKAGES,
     REFERENCE_BASES,
@@ -784,6 +784,7 @@ def incumbent_from_tarball(path: Path, out_dir: Path) -> BuildConfig:
         deck_override=metadata.get("deck_override"),
         deck_files=tuple(metadata.get("deck_files", ("deck.csv",))),
         strategy_weights={str(k): float(v) for k, v in dict(metadata.get("strategy_weights", {})).items()},
+        strategy_genome=dict(metadata.get("strategy_genome", {})),
         policy_variant=str(metadata.get("policy_variant", "default")),
         opponent_model=str(metadata.get("opponent_model", "perfect")),
         origin=str(metadata.get("origin", "incumbent_tarball")),
@@ -836,14 +837,23 @@ def generate_discovery_configs(
     target_paths: list[Path] | None = None,
     pressure_only: bool = False,
     min_diversity_distance: float = 0.0,
+    parents: list[StrategyGenome] | None = None,
 ) -> list[BuildConfig]:
     rng = random.Random(seed + generation * 1009)
     out_dir.mkdir(parents=True, exist_ok=True)
     configs: list[BuildConfig] = []
     pressure_motifs = motifs_from_feedback(feedback_path)
     has_feedback = bool(pressure_motifs or read_feedback(feedback_path).get("pressure_items"))
-    # New discovery is deliberately independent from incumbent decks and code.
-    # Feedback only changes mutation pressure; it never supplies a parent tarball.
+    parent_genomes = list(parents or [])
+    for path in target_paths or []:
+        metadata = read_build_metadata(path)
+        genome_data = dict(metadata.get("strategy_genome", {}))
+        if not genome_data:
+            continue
+        try:
+            parent_genomes.append(StrategyGenome.from_dict(genome_data))
+        except (KeyError, TypeError, ValueError):
+            continue
     base = BuildConfig(
         name=f"d{generation:03d}_canonical_seed",
         out=out_dir / f"d{generation:03d}_canonical_seed.tar.gz",
@@ -859,6 +869,8 @@ def generate_discovery_configs(
             synthetic_population,
             seed + generation * 7919,
             feedback_path,
+            parent_genomes,
+            pressure_only,
         )
     )
     if has_feedback:
@@ -872,9 +884,16 @@ def generate_discovery_configs(
             cfg.strategy_weights.update(pressure_shifts)
             cfg.notes = f"Feedback-directed mutation; {cfg.notes}"
     if loss_digest_path is not None and loss_digest_path.exists() and configs:
+        loss_motifs = {motif.name for motif in motifs_from_loss_digest(loss_digest_path)}
         digest_count = max(1, min(len(configs), population // 6))
         for cfg in configs[-digest_count:]:
             cfg.origin = "motif:loss_digest_strategy_genome"
+            if "switch_pivot" in loss_motifs:
+                cfg.strategy_weights["switch_priority"] = cfg.strategy_weights.get("switch_priority", 1.0) * 1.15
+            if "resource_safety" in loss_motifs or "draw_recovery" in loss_motifs:
+                cfg.strategy_weights["self_mill_penalty"] = cfg.strategy_weights.get("self_mill_penalty", 280.0) * 1.20
+            if "defensive_tools" in loss_motifs:
+                cfg.risk_penalty = max(0.02, cfg.risk_penalty * 0.85)
             cfg.notes = f"Loss-digest mutation; {cfg.notes}"
 
     unique: list[BuildConfig] = []

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import shutil
 import tarfile
+import tempfile
+import time
 from pathlib import Path
 
 
@@ -33,6 +36,57 @@ def safe_extract_tar_gz(tarball: str | Path, dest: str | Path) -> Path:
                 raise SubmissionArchiveError(f"Archive links are not allowed: {member.name}")
         tar.extractall(extract_dir)
 
+    validate_submission_dir(extract_dir)
+    return extract_dir
+
+
+def cached_extract_tar_gz(tarball: str | Path, cache_root: str | Path) -> Path:
+    tarball = Path(tarball).resolve()
+    cache_root = Path(cache_root).resolve()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    digest = sha256_file(tarball)
+    extract_dir = cache_root / digest
+    ready = extract_dir / ".ready"
+    if ready.exists():
+        validate_submission_dir(extract_dir)
+        return extract_dir
+    lock = cache_root / f".{digest}.lock"
+    acquired = False
+    for _ in range(600):
+        try:
+            lock.mkdir()
+            acquired = True
+            break
+        except FileExistsError:
+            if ready.exists():
+                validate_submission_dir(extract_dir)
+                return extract_dir
+            time.sleep(0.05)
+    if not acquired:
+        raise TimeoutError(f"Timed out waiting for archive cache lock: {tarball}")
+    try:
+        if ready.exists():
+            return extract_dir
+        temp_dir = Path(tempfile.mkdtemp(prefix=f".{digest}.", dir=cache_root))
+        try:
+            extracted = safe_extract_tar_gz(tarball, temp_dir)
+            if extract_dir.exists():
+                shutil.rmtree(extract_dir)
+            extracted.replace(extract_dir)
+            ready.write_text(digest, encoding="ascii")
+            for path in sorted(extract_dir.rglob("*"), reverse=True):
+                try:
+                    path.chmod(0o555 if path.is_dir() else 0o444)
+                except OSError:
+                    pass
+            extract_dir.chmod(0o555)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    finally:
+        try:
+            lock.rmdir()
+        except OSError:
+            pass
     validate_submission_dir(extract_dir)
     return extract_dir
 

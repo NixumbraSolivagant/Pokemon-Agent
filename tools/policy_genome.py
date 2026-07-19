@@ -252,7 +252,7 @@ def crossover_genomes(first: StrategyGenome, second: StrategyGenome, index: int,
         ko_threshold=round((first.ko_threshold + second.ko_threshold) / 2),
         bench_floor=round((first.bench_floor + second.bench_floor) / 2),
         card_counts=_normalize_counts(counts, rng),
-        lineage="elite_crossover",
+        lineage="crossover",
     )
 
 
@@ -261,25 +261,45 @@ def generate_genomes(
     seed: int,
     feedback_path: Path | None = None,
     parents: Iterable[StrategyGenome] = (),
+    pressure_only: bool = False,
 ) -> list[StrategyGenome]:
     rng = random.Random(seed)
     bias = failure_bias(load_counterexamples(feedback_path))
+    feedback = {}
+    if feedback_path is not None and feedback_path.exists():
+        try:
+            feedback = json.loads(feedback_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            feedback = {}
+    weighted: Counter[str] = Counter()
+    for item in feedback.get("pressure_items", []):
+        weight = max(0.0, float(item.get("severity", 0.0))) * max(0.0, float(item.get("confidence", 0.0))) * max(0.0, float(item.get("budget_weight", 1.0)))
+        for key, value in dict(item.get("strategy_shifts", {})).items():
+            weighted[str(key)] += weight * float(value)
+    scale = max((abs(value) for value in weighted.values()), default=0.0)
+    if scale > 0:
+        bias.update({key: value / scale for key, value in weighted.items()})
     elite = list(parents)
+    if not elite:
+        elite = [_random_genome(index, rng, bias, lineage="bootstrap_parent") for index in range(min(16, max(4, population // 9)))]
     genomes: list[StrategyGenome] = []
-    if elite:
-        elite_count = min(len(elite), max(1, round(population * 0.20)))
-        genomes.extend(replace(genome, name=f"synthetic_{index:04d}_{genome.deck_family}", lineage="elite") for index, genome in enumerate(elite[:elite_count]))
-    while len(genomes) < population:
-        index = len(genomes)
-        fraction = index / max(1, population)
-        if elite and fraction < 0.40:
-            genomes.append(crossover_genomes(rng.choice(elite), rng.choice(elite), index, rng))
-        elif elite and fraction < 0.70:
-            genomes.append(mutate_genome(rng.choice(elite), index, rng, bias, targeted=True))
-        elif elite and fraction < 0.90:
-            genomes.append(mutate_genome(rng.choice(elite), index, rng, bias))
-        else:
-            genomes.append(_random_genome(index, rng, bias, lineage="family_exploration" if fraction < 0.90 else "random"))
+    if pressure_only:
+        return [mutate_genome(rng.choice(elite), index, rng, bias, targeted=True) for index in range(population)]
+    elite_count = round(population * 0.20)
+    crossover_count = round(population * 0.20)
+    targeted_count = round(population * 0.30)
+    family_count = round(population * 0.20)
+    random_count = population - elite_count - crossover_count - targeted_count - family_count
+    for _ in range(elite_count):
+        genomes.append(mutate_genome(rng.choice(elite), len(genomes), rng, bias))
+    for _ in range(crossover_count):
+        genomes.append(crossover_genomes(rng.choice(elite), rng.choice(elite), len(genomes), rng))
+    for _ in range(targeted_count):
+        genomes.append(mutate_genome(rng.choice(elite), len(genomes), rng, bias, targeted=True))
+    for _ in range(family_count):
+        genomes.append(_random_genome(len(genomes), rng, bias, lineage="family_exploration"))
+    for _ in range(random_count):
+        genomes.append(_random_genome(len(genomes), rng, bias, lineage="random"))
     return genomes[:population]
 
 
@@ -292,13 +312,8 @@ def compile_genome(genome: StrategyGenome, base: BuildConfig, out_dir: Path) -> 
             "prize_delta": 3500.0 * (1.0 + genome.prize_policy),
             "hand_delta": 45.0 * (1.0 + genome.disruption_policy),
             "great_tusk_ready": 6500.0 * (1.0 + genome.opening_policy),
-            "wall_threshold": float(genome.wall_threshold),
-            "ko_threshold": float(genome.ko_threshold),
-            "bench_floor": float(genome.bench_floor),
             "switch_priority": genome.switch_policy,
-            "recovery_priority": genome.recovery_policy,
             "disruption_priority": genome.disruption_policy,
-            "opening_priority": genome.opening_policy,
         }
     )
     return replace(
@@ -309,6 +324,7 @@ def compile_genome(genome: StrategyGenome, base: BuildConfig, out_dir: Path) -> 
         deck_override=_deck_from_genome(genome),
         deck_swaps=[],
         strategy_weights=weights,
+        strategy_genome=genome.to_dict(),
         policy_variant=f"synthetic_{genome.route}",
         belief_worlds=genome.search_worlds,
         risk_penalty=genome.risk_penalty,
@@ -325,8 +341,9 @@ def generate_synthetic_configs(
     seed: int,
     feedback_path: Path | None = None,
     parents: Iterable[StrategyGenome] = (),
+    pressure_only: bool = False,
 ) -> list[BuildConfig]:
-    return [compile_genome(genome, base, out_dir) for genome in generate_genomes(population, seed, feedback_path, parents)]
+    return [compile_genome(genome, base, out_dir) for genome in generate_genomes(population, seed, feedback_path, parents, pressure_only)]
 
 
 def compile_opponent_genome(genome: OpponentGenome, base: BuildConfig, out_dir: Path) -> BuildConfig:

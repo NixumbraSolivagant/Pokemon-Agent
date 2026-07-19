@@ -11,7 +11,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from .archive import safe_extract_tar_gz
+from .archive import cached_extract_tar_gz, safe_extract_tar_gz
 from .models import EvalConfig, GameResult
 from .player import PlayerProcess
 
@@ -97,6 +97,7 @@ def play_game(
 ) -> GameResult:
     ctx = mp.get_context("spawn")
     queue: mp.Queue = ctx.Queue(maxsize=1)
+    record_trace = _should_record_before_game(game_id, seed, config)
     with tempfile.TemporaryDirectory(prefix="pokemon_local_eval_trace_") as trace_tmp:
         trace_path = Path(trace_tmp) / f"{game_id}.jsonl"
         proc = ctx.Process(
@@ -111,6 +112,7 @@ def play_game(
                 config,
                 str(project_root),
                 str(trace_path),
+                record_trace,
                 queue,
             ),
         )
@@ -160,6 +162,8 @@ def play_game(
             return result
         result = queue.get()
         result.trace = _read_trace(trace_path) if _should_keep_trace(result, config) else []
+        if _should_keep_trace(result, config) and not result.trace and result.reason != "RESULT":
+            result.trace = [{"event": "diagnostic", "reason": result.reason, "error": result.error}]
         return result
 
 
@@ -173,6 +177,7 @@ def _play_game_worker(
     config: EvalConfig,
     project_root: str,
     trace_path: str,
+    record_trace: bool,
     queue: mp.Queue,
 ) -> None:
     started = time.perf_counter()
@@ -184,14 +189,19 @@ def _play_game_worker(
         random.seed(seed)
         with tempfile.TemporaryDirectory(prefix="pokemon_local_eval_") as tmp:
             tmp_path = Path(tmp)
-            p0_dir = safe_extract_tar_gz(p0_tarball, tmp_path / "p0")
-            p1_dir = safe_extract_tar_gz(p1_tarball, tmp_path / "p1")
+            if config.archive_cache_dir:
+                p0_dir = cached_extract_tar_gz(p0_tarball, config.archive_cache_dir)
+                p1_dir = cached_extract_tar_gz(p1_tarball, config.archive_cache_dir)
+            else:
+                p0_dir = safe_extract_tar_gz(p0_tarball, tmp_path / "p0")
+                p1_dir = safe_extract_tar_gz(p1_tarball, tmp_path / "p1")
 
             sys.path.insert(0, str(p0_dir))
             from cg.game import battle_finish, battle_select, battle_start
 
-            p0 = PlayerProcess(p0_name, p0_dir, Path(project_root), config.act_timeout_s, config.import_timeout_s)
-            p1 = PlayerProcess(p1_name, p1_dir, Path(project_root), config.act_timeout_s, config.import_timeout_s)
+            player_logs = tmp_path / "player_logs"
+            p0 = PlayerProcess(p0_name, p0_dir, Path(project_root), config.act_timeout_s, config.import_timeout_s, player_logs)
+            p1 = PlayerProcess(p1_name, p1_dir, Path(project_root), config.act_timeout_s, config.import_timeout_s, player_logs)
             try:
                 p0.start()
             except Exception as exc:
@@ -212,16 +222,14 @@ def _play_game_worker(
             except Exception as exc:
                 queue.put(_forfeit(game_id, p0_name, p1_name, seed, 1, "DECK_ERROR", actions, started, str(exc)))
                 return
-            _write_trace(
-                trace_file,
-                {
+            if record_trace:
+                _write_trace(trace_file, {
                     "event": "deck",
                     "p0": p0_name,
                     "p1": p1_name,
                     "p0_deck": deck0,
                     "p1_deck": deck1,
-                },
-            )
+                })
             overage = {0: config.overage_time_s, 1: config.overage_time_s}
             obs, _ = battle_start(deck0, deck1)
             if obs is None:
@@ -260,23 +268,27 @@ def _play_game_worker(
                         step_record["selected_options"] = _selected_options(obs, action)
                     except TimeoutError as exc:
                         step_record["error"] = str(exc)
-                        _write_trace(trace_file, step_record)
+                        if record_trace:
+                            _write_trace(trace_file, step_record)
                         queue.put(_forfeit(game_id, p0_name, p1_name, seed, player_idx, "TIMEOUT", actions, started, str(exc)))
                         return
                     except Exception as exc:
                         step_record["raw_action"] = locals().get("raw_action")
                         step_record["error"] = str(exc)
-                        _write_trace(trace_file, step_record)
+                        if record_trace:
+                            _write_trace(trace_file, step_record)
                         queue.put(_forfeit(game_id, p0_name, p1_name, seed, player_idx, "INVALID_ACTION", actions, started, str(exc)))
                         return
                     actions += 1
                     try:
                         obs = battle_select(action)
                         step_record["next_result"] = (obs.get("current") or {}).get("result", -1)
-                        _write_trace(trace_file, step_record)
+                        if record_trace:
+                            _write_trace(trace_file, step_record)
                     except Exception as exc:
                         step_record["error"] = str(exc)
-                        _write_trace(trace_file, step_record)
+                        if record_trace:
+                            _write_trace(trace_file, step_record)
                         queue.put(_forfeit(game_id, p0_name, p1_name, seed, player_idx, "ENGINE_REJECTED_ACTION", actions, started, str(exc)))
                         return
                 queue.put(
@@ -505,10 +517,23 @@ def _should_keep_trace(result: GameResult, config: EvalConfig) -> bool:
     if mode == "sample":
         if result.reason != "RESULT" or result.outcome == "NO_RESULT":
             return True
-        rate = max(0.0, min(1.0, float(config.record_sample_rate)))
-        if rate <= 0:
-            return False
-        digest = hashlib.sha256(f"{result.game_id}:{result.seed}".encode("utf-8")).digest()
-        bucket = int.from_bytes(digest[:8], "big") / float(2**64 - 1)
-        return bucket < rate
+        return _sample_trace_selected(result.game_id, result.seed, config.record_sample_rate)
     return True
+
+
+def _should_record_before_game(game_id: str, seed: int, config: EvalConfig) -> bool:
+    mode = (config.record_mode or "all").lower()
+    if mode == "none":
+        return False
+    if mode == "sample":
+        return _sample_trace_selected(game_id, seed, config.record_sample_rate)
+    return True
+
+
+def _sample_trace_selected(game_id: str, seed: int, rate: float) -> bool:
+    normalized = max(0.0, min(1.0, float(rate)))
+    if normalized <= 0:
+        return False
+    digest = hashlib.sha256(f"{game_id}:{seed}".encode("utf-8")).digest()
+    bucket = int.from_bytes(digest[:8], "big") / float(2**64 - 1)
+    return bucket < normalized

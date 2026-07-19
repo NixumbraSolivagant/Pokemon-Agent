@@ -32,6 +32,8 @@ class EvalConfig:
     progress_interval_s: float = 5.0
     progress_mode: str = "auto"
     progress_file: str = ""
+    archive_cache_dir: str = ""
+    max_in_flight: int = 0
 
 
 @dataclass(slots=True)

@@ -8,6 +8,7 @@ from local_eval.models import AgentStats, EvalConfig, MatchReport
 from tools.build_models import BuildConfig
 from tools.build_submission import build_submission
 from tools.opponent_models import OpponentArchive, base_opponent_genomes, generate_counter_opponents
+from tools.policy_genome import generate_genomes
 from tools.racing import classify_roles, rank_for_racing, robust_stats
 
 
@@ -39,6 +40,20 @@ def test_counter_opponents_are_reproducible_and_archived(tmp_path: Path):
     path = tmp_path / "opponents.json"
     archive.save(path)
     assert len(OpponentArchive.load(path).genomes()) >= len(base_opponent_genomes())
+
+
+def test_strategy_population_uses_fixed_operator_mix():
+    genomes = generate_genomes(144, 123)
+    counts = {}
+    for genome in genomes:
+        counts[genome.lineage] = counts.get(genome.lineage, 0) + 1
+    assert counts == {
+        "elite_mutation": 29,
+        "crossover": 29,
+        "counterexample_mutation": 43,
+        "family_exploration": 29,
+        "random": 14,
+    }
 
 
 def test_racing_prefers_stable_candidate_and_assigns_three_roles():

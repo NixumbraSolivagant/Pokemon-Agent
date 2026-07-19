@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+import hashlib
 import json
 import random
 from pathlib import Path
@@ -79,16 +80,22 @@ def base_opponent_genomes() -> list[OpponentGenome]:
     ]
 
 
-def mutate_opponent(parent: OpponentGenome, index: int, seed: int, pressure: dict[str, float] | None = None) -> OpponentGenome:
+def mutate_opponent(
+    parent: OpponentGenome,
+    index: int,
+    seed: int,
+    pressure: dict[str, float] | None = None,
+    generation: int = 0,
+) -> OpponentGenome:
     rng = random.Random(seed + index * 1009)
     pressure = pressure or {}
 
     def shifted(value: float, key: str) -> float:
         return round(min(1.0, max(0.0, value + rng.uniform(-0.18, 0.18) + 0.08 * pressure.get(key, 0.0))), 3)
 
-    return replace(
+    mutated = replace(
         parent,
-        name=f"counter_{index:04d}_{parent.deck_family}",
+        name=parent.name,
         aggression=shifted(parent.aggression, "aggression"),
         tempo=shifted(parent.tempo, "tempo"),
         bench_pressure=shifted(parent.bench_pressure, "bench_pressure"),
@@ -98,6 +105,8 @@ def mutate_opponent(parent: OpponentGenome, index: int, seed: int, pressure: dic
         prize_race_bias=shifted(parent.prize_race_bias, "prize_race_bias"),
         lineage="counterexample",
     )
+    digest = hashlib.sha256(json.dumps(mutated.to_dict(), sort_keys=True).encode("utf-8")).hexdigest()[:10]
+    return replace(mutated, name=f"counter_g{generation:03d}_{index:04d}_{digest}_{parent.deck_family}")
 
 
 def generate_counter_opponents(
@@ -105,10 +114,11 @@ def generate_counter_opponents(
     seed: int,
     pressure: dict[str, float] | None = None,
     parents: Iterable[OpponentGenome] = (),
+    generation: int = 0,
 ) -> list[OpponentGenome]:
     rng = random.Random(seed)
     pool = list(parents) or base_opponent_genomes()
-    return [mutate_opponent(rng.choice(pool), index, seed, pressure) for index in range(max(0, count))]
+    return [mutate_opponent(rng.choice(pool), index, seed, pressure, generation) for index in range(max(0, count))]
 
 
 class OpponentArchive:
@@ -124,6 +134,15 @@ class OpponentArchive:
 
     def genomes(self) -> list[OpponentGenome]:
         return list(self._genomes.values())
+
+    def compact(self, limit: int = 128) -> None:
+        if len(self._genomes) <= limit:
+            return
+        counters = [genome for genome in self._genomes.values() if genome.name.startswith("counter_g")]
+        bases = [genome for genome in self._genomes.values() if not genome.name.startswith("counter_g")]
+        counters.sort(key=lambda genome: genome.name, reverse=True)
+        kept = [*bases, *counters[: max(0, limit - len(bases))]]
+        self._genomes = {genome.name: genome for genome in kept}
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

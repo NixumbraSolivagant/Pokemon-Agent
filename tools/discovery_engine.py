@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -22,9 +23,9 @@ from tools.export_kaggle_submission import export_kaggle_submission
 from tools.gold_gate import classify_candidate as classify_gold_candidate
 from tools.loss_mining import digest_loss_files, digest_scenarios, load_scenarios as load_loss_scenarios, mine_losses
 from tools.opponent_models import OpponentArchive, generate_counter_opponents
-from tools.policy_genome import compile_opponent_genome
+from tools.policy_genome import StrategyArchive, StrategyGenome, compile_opponent_genome
 from tools.psro import psro_bonus_names, write_psro
-from tools.racing import rank_for_racing, report_racing
+from tools.racing import rank_for_racing, report_racing, robust_stats, wilson_lower_bound
 from tools.reference_pool import DEFAULT_REFERENCE_PATHS
 from tools.scenario_eval import run_scenarios
 
@@ -34,6 +35,13 @@ DEFAULT_INCUMBENT = Path("outputs/submissions/champion_latest.tar.gz")
 DEFAULT_PROMOTE = Path("outputs/submissions/champion_discovery.tar.gz")
 DEFAULT_SUBMISSION = Path("outputs/submissions/submission_discovery.tar.gz")
 DEFAULT_POOL = DEFAULT_REFERENCE_PATHS
+MAX_DISCOVERY_WORKERS = 30
+REQUIRED_ANCHOR_NAMES = (
+    "i-have-one-rear-card",
+    "submission_820",
+    "pokemon-ai-battle-best-ptcg-advanced",
+    "multiply-agent-best-940-lb",
+)
 
 
 @dataclass(slots=True)
@@ -118,13 +126,13 @@ def profile_from_name(name: str) -> DiscoveryProfile:
     return DiscoveryProfile(
         name=name,
         generations=24,
-        population=224,
+        population=144,
         workers=0,
         max_actions=1000,
         run_timeout_s=180.0,
-        stage_a=Stage("stage_a", 4, 96, 10, "none", 32),
-        stage_b=Stage("stage_b", 16, 40, 10, "sample", 12),
-        stage_c=Stage("stage_c_confirm", 64, 12, 12, "sample", 6),
+        stage_a=Stage("stage_a", 4, 144, 10, "none", 48),
+        stage_b=Stage("stage_b", 16, 48, 10, "sample", 16),
+        stage_c=Stage("stage_c_confirm", 64, 16, 12, "sample", 6),
         stage_d=Stage("stage_d_holdout", 512, 4, 14, "sample", 4),
         manual_slots=10,
         max_no_result_rate=0.01,
@@ -136,19 +144,19 @@ def profile_from_name(name: str) -> DiscoveryProfile:
 def resolve_workers(args: argparse.Namespace, profile: DiscoveryProfile) -> int:
     requested = args.workers if args.workers is not None else profile.workers
     if requested and requested > 0:
-        return requested
+        return min(MAX_DISCOVERY_WORKERS, requested)
     cpu_count = os.cpu_count() or max(1, profile.workers)
     workers = max(1, cpu_count - max(0, args.cpu_headroom))
     if args.max_workers and args.max_workers > 0:
         workers = min(workers, args.max_workers)
-    return workers
+    return min(MAX_DISCOVERY_WORKERS, workers)
 
 
 def resolve_build_workers(args: argparse.Namespace, profile: DiscoveryProfile) -> int:
     requested = getattr(args, "build_workers", None)
     if requested is not None:
         return max(1, requested)
-    return max(1, min(32, resolve_workers(args, profile)))
+    return max(1, min(MAX_DISCOVERY_WORKERS, resolve_workers(args, profile)))
 
 
 def config_to_dict(cfg: BuildConfig) -> dict[str, Any]:
@@ -166,6 +174,8 @@ def candidate_generation_summary(configs: list[BuildConfig], requested_populatio
     deck_overrides = 0
     opponent_models: dict[str, int] = {}
     policy_variants: dict[str, int] = {}
+    lineages: dict[str, int] = {}
+    deck_hashes: set[str] = set()
     for cfg in configs:
         origins[cfg.origin or "unknown"] = origins.get(cfg.origin or "unknown", 0) + 1
         families[cfg.family or "unknown"] = families.get(cfg.family or "unknown", 0) + 1
@@ -173,6 +183,9 @@ def candidate_generation_summary(configs: list[BuildConfig], requested_populatio
         policy_variants[cfg.policy_variant or "default"] = policy_variants.get(cfg.policy_variant or "default", 0) + 1
         if cfg.deck_override:
             deck_overrides += 1
+            deck_hashes.add(hashlib.sha256(",".join(map(str, sorted(cfg.deck_override))).encode("utf-8")).hexdigest())
+        lineage = str(cfg.strategy_genome.get("lineage", "unknown")) if cfg.strategy_genome else "unknown"
+        lineages[lineage] = lineages.get(lineage, 0) + 1
     summary = {
         "population_requested": requested_population,
         "configs_generated": len(configs),
@@ -180,6 +193,8 @@ def candidate_generation_summary(configs: list[BuildConfig], requested_populatio
         "underfilled": len(configs) < requested_population,
         "underfill_ratio": (len(configs) / requested_population) if requested_population else 1.0,
         "deck_overrides": deck_overrides,
+        "unique_decks": len(deck_hashes),
+        "lineage_counts": dict(sorted(lineages.items(), key=lambda kv: (-kv[1], kv[0]))),
         "origin_counts": dict(sorted(origins.items(), key=lambda kv: (-kv[1], kv[0]))),
         "family_counts": dict(sorted(families.items(), key=lambda kv: (-kv[1], kv[0]))),
         "opponent_model_counts": dict(sorted(opponent_models.items(), key=lambda kv: (-kv[1], kv[0]))),
@@ -443,6 +458,8 @@ def classify_final(
     delta = float(final.get("score_delta_vs_incumbent") or 0.0)
     h2h_wins = int(final.get("h2h_wins") or 0)
     h2h_losses = int(final.get("h2h_losses") or 0)
+    h2h_wilson = final.get("h2h_wilson_low")
+    robust_margin = final.get("robust_score_margin")
     stage_rows = [row for row in final.get("stage_d_top", []) if isinstance(row, dict)]
     best_row = next((row for row in stage_rows if row.get("name") == final.get("name") or row.get("name") == final.get("best")), {})
     nr_rate = no_result_rate(best_row) if best_row else 0.0
@@ -455,8 +472,12 @@ def classify_final(
         return {"champion_class": "failed", "decision": "rerun_required", "submit_ready": False, "reasons": ["run failed", *reasons]}
     if status != "promoted":
         return {"champion_class": "portfolio_candidate", "decision": "hold_portfolio", "submit_ready": False, "reasons": ["not promoted", *reasons]}
-    if delta < min_delta:
+    if h2h_wilson is None and delta < min_delta:
         reasons.append(f"score_delta {delta:.3f} below {min_delta:.3f}")
+    if h2h_wilson is not None and float(h2h_wilson) < 0.50:
+        reasons.append(f"H2H Wilson lower bound {float(h2h_wilson):.3f} below 0.500")
+    if robust_margin is not None and float(robust_margin) < 0.0:
+        reasons.append(f"anchor robust score margin {float(robust_margin):.3f} below 0.000")
     if h2h_wins < h2h_losses:
         reasons.append(f"H2H losing vs incumbent: {h2h_wins}-{h2h_losses}")
     if nr_rate > max_no_result_rate:
@@ -672,6 +693,31 @@ def history_records(state: dict[str, Any]) -> list[dict[str, Any]]:
     return records
 
 
+def opponent_pressure_from_feedback(feedback: dict[str, Any]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    motif_keys = {
+        "switch_pivot": "switch_frequency",
+        "resource_safety": "resource_denial",
+        "hand_disruption": "resource_denial",
+        "defensive_tools": "bench_pressure",
+        "prize_race": "prize_race_bias",
+        "fast_ko": "tempo",
+    }
+    for item in feedback.get("pressure_items", []):
+        weight = max(0.0, float(item.get("severity", 0.0))) * max(0.0, float(item.get("confidence", 0.0))) * max(0.0, float(item.get("budget_weight", 1.0)))
+        for motif in item.get("recommended_motifs", []):
+            key = motif_keys.get(str(motif))
+            if key:
+                totals[key] = totals.get(key, 0.0) + weight
+        opponent = str(item.get("target_opponent") or "").lower()
+        if "mill" in opponent:
+            totals["self_mill"] = totals.get("self_mill", 0.0) + weight
+        if "lucario" in opponent or "ko" in opponent:
+            totals["aggression"] = totals.get("aggression", 0.0) + weight
+    scale = max(totals.values(), default=0.0)
+    return {key: value / scale for key, value in totals.items()} if scale > 0 else {}
+
+
 def build_generation_feedback(
     args: argparse.Namespace,
     gen_dir: Path,
@@ -776,6 +822,42 @@ def evaluation_pools(
     return discovery, holdout
 
 
+def select_stage_opponents(pool: list[Path], stage: Stage, incumbent_path: Path | None = None) -> list[Path]:
+    existing = unique_existing(pool)
+    if stage.pool_limit <= 0:
+        return []
+    incumbent_resolved = incumbent_path.resolve() if incumbent_path and incumbent_path.exists() else None
+    incumbent: list[Path] = []
+    required: list[Path] = []
+    counters: list[Path] = []
+    remaining: list[Path] = []
+    for path in existing:
+        name = submission_name(path)
+        if incumbent_resolved is not None and path.resolve() == incumbent_resolved:
+            incumbent.append(path)
+        elif name in REQUIRED_ANCHOR_NAMES:
+            required.append(path)
+        elif name.startswith("counter_"):
+            counters.append(path)
+        else:
+            remaining.append(path)
+    missing = [name for name in REQUIRED_ANCHOR_NAMES if name not in {submission_name(path) for path in required}]
+    if incumbent_resolved is not None and not incumbent:
+        missing.insert(0, "incumbent")
+    if missing:
+        raise ValueError(f"Missing required evaluation anchors: {', '.join(missing)}")
+    fixed = [*incumbent[:1], *sorted(required, key=lambda path: REQUIRED_ANCHOR_NAMES.index(submission_name(path)))]
+    if len(fixed) > stage.pool_limit:
+        raise ValueError(f"Stage {stage.name} pool_limit={stage.pool_limit} cannot fit required anchors")
+    counter_quota = 4 if stage.pool_limit >= 12 else 3
+    selected = [*fixed, *counters[: min(counter_quota, stage.pool_limit - len(fixed))]]
+    for path in remaining:
+        if len(selected) >= stage.pool_limit:
+            break
+        selected.append(path)
+    return selected
+
+
 def run_scenario_gate(
     records: list[CandidateRecord],
     names: list[str],
@@ -862,6 +944,44 @@ def select_next_names(
     return names[: max(1, stage.candidate_limit)]
 
 
+def anchor_only_report(report: MatchReport, candidate_names: set[str]) -> MatchReport:
+    standings: list[AgentStats] = []
+    for stats in report.standings:
+        if stats.name not in candidate_names:
+            standings.append(stats)
+            continue
+        opponents = {
+            name: dict(record)
+            for name, record in stats.opponents.items()
+            if name not in candidate_names
+        }
+        wins = sum(record["wins"] for record in opponents.values())
+        losses = sum(record["losses"] for record in opponents.values())
+        draws = sum(record["draws"] for record in opponents.values())
+        standings.append(
+            AgentStats(
+                name=stats.name,
+                tarball=stats.tarball,
+                sha256=stats.sha256,
+                games=wins + losses + draws,
+                wins=wins,
+                losses=losses,
+                draws=draws,
+                crashes=stats.crashes,
+                timeouts=stats.timeouts,
+                invalids=stats.invalids,
+                no_results=0,
+                mu=stats.mu,
+                sigma=stats.sigma,
+                kaggle_score_estimate=stats.kaggle_score_estimate,
+                opponents=opponents,
+            )
+        )
+    metadata = dict(report.metadata)
+    metadata["primary_score"] = "anchor_only"
+    return MatchReport(report.config, report.submissions, report.games, standings, metadata)
+
+
 def eval_stage(
     records: list[CandidateRecord],
     selected_names: list[str],
@@ -879,7 +999,8 @@ def eval_stage(
         ordered_names = [incumbent_name] + ordered_names
     selected_records = [by_name[name] for name in ordered_names[: stage.candidate_limit]]
     candidate_tarballs = unique_existing([Path(record.eval_tarball) for record in selected_records])
-    opponent_tarballs = unique_existing(pool[: stage.pool_limit])
+    incumbent_path = Path(by_name[incumbent_name].eval_tarball) if incumbent_name in by_name else None
+    opponent_tarballs = select_stage_opponents(pool, stage, incumbent_path)
     cfg = EvalConfig(
         seed=args.seed + seed_offset,
         workers=resolve_workers(args, profile),
@@ -893,6 +1014,8 @@ def eval_stage(
         progress_interval_s=args.progress_interval,
         progress_mode=args.progress_mode,
         progress_file=str(out_dir / "progress.txt") if args.progress_mode == "file" else "",
+        archive_cache_dir=str(args.out / ".submission_cache"),
+        max_in_flight=resolve_workers(args, profile) * 2,
     )
     report = run_candidate_pool(
         candidate_tarballs,
@@ -904,7 +1027,8 @@ def eval_stage(
     )
     save_report(report, out_dir / stage.name)
     write_psro(report, out_dir / stage.name / "psro.json", [r.name for r in selected_records])
-    next_names = select_next_names(report, selected_records, stage, profile, incumbent_name)
+    primary_report = anchor_only_report(report, {record.name for record in selected_records})
+    next_names = select_next_names(primary_report, selected_records, stage, profile, incumbent_name)
     return report, next_names
 
 
@@ -977,6 +1101,32 @@ def hof_paths_from_state(state: dict[str, Any], limit: int = 16) -> list[Path]:
     return list(reversed(out[:limit]))
 
 
+def update_strategy_archive(
+    archive: StrategyArchive,
+    records: list[CandidateRecord],
+    report: MatchReport,
+    names: list[str],
+) -> int:
+    by_record = candidate_by_name(records)
+    stats = stats_by_name(report)
+    added = 0
+    for name in names:
+        record = by_record.get(name)
+        row = stats.get(name)
+        if record is None or row is None:
+            continue
+        genome_data = dict(record.config.get("strategy_genome") or {})
+        if not genome_data:
+            continue
+        try:
+            genome = StrategyGenome.from_dict(genome_data)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if archive.add(genome, float(row.kaggle_score_estimate)):
+            added += 1
+    return added
+
+
 def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: DiscoveryProfile, generation: int) -> dict[str, Any]:
     gen_dir = args.out / f"generation_{generation:03d}"
     variants_dir = gen_dir / "variants"
@@ -987,6 +1137,8 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
     previous_feedback = read_json(feedback_path) if feedback_path and feedback_path.exists() else {}
     target_paths = resolve_feedback_target_paths(previous_feedback, history_records(state))
     requested_population = args.population or profile.population
+    strategy_archive_path = args.out / "strategy_archive.json"
+    strategy_archive = StrategyArchive.load(strategy_archive_path)
     set_run_phase(state, args.out, generation, "build", "generating candidate configs")
     configs = generate_discovery_configs(
         incumbent_tarball=incumbent_tarball,
@@ -1000,6 +1152,7 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
         feedback_path=feedback_path if feedback_path and feedback_path.exists() else None,
         target_paths=target_paths,
         min_diversity_distance=args.min_diversity_distance,
+        parents=strategy_archive.elites(),
     )
     opponent_archive_path = args.out / "opponent_archive.json"
     opponent_archive = OpponentArchive.load(opponent_archive_path)
@@ -1007,9 +1160,12 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
         count=max(6, min(16, requested_population // 8)),
         seed=args.seed + generation * 3571,
         parents=opponent_archive.genomes(),
+        pressure=opponent_pressure_from_feedback(previous_feedback),
+        generation=generation,
     )
     for genome in counter_genomes:
         opponent_archive.add(genome)
+    opponent_archive.compact()
     opponent_archive.save(opponent_archive_path)
     opponent_base = BuildConfig(name="counter_runtime", origin="coevolved_opponent")
     opponent_configs = [compile_opponent_genome(genome, opponent_base, gen_dir / "opponent_variants") for genome in counter_genomes]
@@ -1208,9 +1364,12 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
     stats = stats_by_name(report_d)
     by_name = candidate_by_name(records)
     clean_names = [name for name in names_d if name in stats and clean_stats(stats[name], profile.max_no_result_rate)]
-    racing = report_racing(report_d, clean_names)
+    primary_report_d = anchor_only_report(report_d, set(by_name))
+    racing = report_racing(primary_report_d, clean_names)
     roles = dict(racing.get("roles") or {})
     clean_names = [name for name in racing.get("ranked", []) if name in clean_names]
+    archive_added = update_strategy_archive(strategy_archive, records, report_d, clean_names)
+    strategy_archive.save(strategy_archive_path)
     write_json(gen_dir / "racing_report.json", racing)
     write_json(gen_dir / "robustness_report.json", racing)
     if not clean_names:
@@ -1222,10 +1381,21 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
         h2h_losses = 0
         if incumbent_name in stats and best_name != incumbent_name:
             delta, h2h_wins, h2h_losses = score_delta(report_d, best_name, incumbent_name)
-        strict_ok = best_name != incumbent_name and (
-            incumbent_name not in stats
-            or (delta >= args.min_holdout_score_delta if args.min_holdout_score_delta is not None else profile.min_holdout_score_delta)
-        ) and (incumbent_name not in stats or h2h_wins >= h2h_losses)
+        h2h_draws = 0
+        h2h_wilson = 0.0
+        robust_margin = float("-inf")
+        if best_name in stats and incumbent_name in stats and best_name != incumbent_name:
+            h2h = stats[best_name].opponents.get(incumbent_name, {"wins": 0, "losses": 0, "draws": 0})
+            h2h_draws = int(h2h.get("draws", 0))
+            h2h_wilson = wilson_lower_bound(h2h_wins, h2h_losses, h2h_draws)
+            primary_stats = stats_by_name(primary_report_d)
+            robust_margin = robust_stats(primary_stats[best_name])["robust_score"] - robust_stats(primary_stats[incumbent_name])["robust_score"]
+        strict_ok = (
+            best_name != incumbent_name
+            and incumbent_name in stats
+            and h2h_wilson >= 0.50
+            and robust_margin >= 0.0
+        )
         role_order = {"generalist": 0, "anti_fast_ko": 1, "anti_control": 2}
         manual_names = sorted(
             [name for name in clean_names if name != incumbent_name],
@@ -1233,17 +1403,31 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
         )
         if strict_ok:
             final = export_candidate(by_name[best_name], args.promote, args.submission_out, args.strip_search_wrapper)
-            final.update({"status": "promoted", "score_delta_vs_incumbent": delta, "h2h_wins": h2h_wins, "h2h_losses": h2h_losses})
+            final.update({
+                "status": "promoted",
+                "score_delta_vs_incumbent": delta,
+                "h2h_wins": h2h_wins,
+                "h2h_losses": h2h_losses,
+                "h2h_draws": h2h_draws,
+                "h2h_wilson_low": h2h_wilson,
+                "robust_score_margin": robust_margin,
+            })
             state["incumbent"] = final["promote"]
         else:
             gate_reasons = []
             threshold = args.min_holdout_score_delta if args.min_holdout_score_delta is not None else profile.min_holdout_score_delta
             if best_name == incumbent_name:
                 gate_reasons.append("best candidate is the incumbent")
+            if incumbent_name not in stats:
+                gate_reasons.append("incumbent missing from Stage D report")
             if incumbent_name in stats and delta < threshold:
                 gate_reasons.append("score_delta below threshold")
             if incumbent_name in stats and h2h_wins < h2h_losses:
                 gate_reasons.append(f"H2H losing vs incumbent: {h2h_wins}-{h2h_losses}")
+            if incumbent_name in stats and h2h_wilson < 0.50:
+                gate_reasons.append(f"H2H Wilson lower bound below 0.500: {h2h_wilson:.3f}")
+            if incumbent_name in stats and robust_margin < 0.0:
+                gate_reasons.append(f"anchor robust score margin below 0.000: {robust_margin:.3f}")
             final = {
                 "status": "held",
                 "reason": "best holdout candidate did not clear strict incumbent gate",
@@ -1251,6 +1435,9 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
                 "score_delta_vs_incumbent": delta,
                 "h2h_wins": h2h_wins,
                 "h2h_losses": h2h_losses,
+                "h2h_draws": h2h_draws,
+                "h2h_wilson_low": h2h_wilson,
+                "robust_score_margin": robust_margin,
                 "incumbent": str(incumbent_tarball),
                 "gate_reasons": gate_reasons,
             }
@@ -1325,6 +1512,12 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
     final["microburst"] = state.get("microburst", {})
     final["pool_manifest"] = {"out": str(gen_dir / "pool_manifest.json"), "role_counts": pool_manifest.get("role_counts", {})}
     final["candidate_generation"] = {**generation_summary, "out": str(gen_dir / "candidate_generation.json")}
+    final["strategy_archive"] = {
+        "out": str(strategy_archive_path),
+        "parents_loaded": len(strategy_archive.elites()) - archive_added,
+        "entries_added": archive_added,
+        "entries": len(strategy_archive.elites()),
+    }
     final["reports"] = {
         "stage_a": str(gen_dir / profile.stage_a.name / "report.json"),
         "stage_b": str(gen_dir / profile.stage_b.name / "report.json"),

@@ -31,6 +31,7 @@ class BuildConfig:
     deck_override: list[int] | None = None
     deck_files: tuple[str, ...] = ("deck.csv",)
     strategy_weights: dict[str, float] = field(default_factory=dict)
+    strategy_genome: dict[str, object] = field(default_factory=dict)
     policy_variant: str = "default"
     opponent_model: str = "perfect"
     origin: str = ""

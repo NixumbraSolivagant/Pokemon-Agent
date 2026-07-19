@@ -8,7 +8,7 @@ import platform
 import shutil
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict
 from pathlib import Path
 
@@ -144,24 +144,25 @@ def _run_indexed_schedule(
     }
 
     game_results: list[GameResult] = []
-    jobs: list[tuple[int, str, str, int, str]] = []
-    game_no = 0
     for first, second in pair_indices:
         if first < 0 or second < 0 or first >= len(names) or second >= len(names) or first == second:
             raise ValueError(f"Invalid matchup pair: {(first, second)} for {len(names)} submissions")
-        name_a, name_b = names[first], names[second]
-        for local_idx in range(games_per_pair):
-            swap = local_idx % 2 == 1
-            p0_name, p1_name = (name_b, name_a) if swap else (name_a, name_b)
-            seed = config.seed + game_no
-            game_id = f"g{game_no:06d}"
-            jobs.append((game_no, p0_name, p1_name, seed, game_id))
-            game_no += 1
+    total_jobs = len(pair_indices) * games_per_pair
+
+    def _jobs():
+        game_no = 0
+        for first, second in pair_indices:
+            name_a, name_b = names[first], names[second]
+            for local_idx in range(games_per_pair):
+                swap = local_idx % 2 == 1
+                p0_name, p1_name = (name_b, name_a) if swap else (name_a, name_b)
+                yield game_no, p0_name, p1_name, config.seed + game_no, f"g{game_no:06d}"
+                game_no += 1
     _progress(
         config,
         "start",
         done=0,
-        total=len(jobs),
+        total=total_jobs,
         extra=f"schedule={schedule_name} agents={len(names)} pairs={len(pair_indices)} games_per_pair={games_per_pair} workers={config.workers}",
         force=True,
     )
@@ -180,44 +181,50 @@ def _run_indexed_schedule(
         )
         return idx, result
 
-    if config.workers > 1 and len(jobs) > 1:
+    if config.workers > 1 and total_jobs > 1:
         results_by_idx: dict[int, GameResult] = {}
         completed = 0
         last_progress = 0.0
+        job_iter = iter(_jobs())
+        in_flight_limit = max(config.workers, config.max_in_flight or config.workers * 2)
         with ThreadPoolExecutor(max_workers=config.workers) as executor:
-            futures = [executor.submit(_run_job, job) for job in jobs]
-            for future in as_completed(futures):
-                idx, result = future.result()
-                results_by_idx[idx] = result
-                completed += 1
-                now = time.monotonic()
-                if completed == len(jobs) or now - last_progress >= max(0.25, config.progress_interval_s):
-                    last_progress = now
-                    _progress(
-                        config,
-                        "games",
-                        done=completed,
-                        total=len(jobs),
-                        extra=_progress_result_summary(result),
-                        force=completed == len(jobs),
-                    )
-        ordered_results = [results_by_idx[idx] for idx in range(len(jobs))]
+            futures = {}
+            for _ in range(min(in_flight_limit, total_jobs)):
+                job = next(job_iter, None)
+                if job is None:
+                    break
+                futures[executor.submit(_run_job, job)] = job[0]
+            while futures:
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    futures.pop(future, None)
+                    idx, result = future.result()
+                    results_by_idx[idx] = result
+                    completed += 1
+                    job = next(job_iter, None)
+                    if job is not None:
+                        futures[executor.submit(_run_job, job)] = job[0]
+                    now = time.monotonic()
+                    if completed == total_jobs or now - last_progress >= max(0.25, config.progress_interval_s):
+                        last_progress = now
+                        _progress(config, "games", completed, total_jobs, _progress_result_summary(result), completed == total_jobs)
+        ordered_results = [results_by_idx[idx] for idx in range(total_jobs)]
     else:
         ordered_results = []
         last_progress = 0.0
-        for job in jobs:
+        for job in _jobs():
             result = _run_job(job)[1]
             ordered_results.append(result)
             now = time.monotonic()
-            if len(ordered_results) == len(jobs) or now - last_progress >= max(0.25, config.progress_interval_s):
+            if len(ordered_results) == total_jobs or now - last_progress >= max(0.25, config.progress_interval_s):
                 last_progress = now
                 _progress(
                     config,
                     "games",
                     done=len(ordered_results),
-                    total=len(jobs),
+                    total=total_jobs,
                     extra=_progress_result_summary(result),
-                    force=len(ordered_results) == len(jobs),
+                    force=len(ordered_results) == total_jobs,
                 )
 
     for result in ordered_results:
@@ -350,6 +357,7 @@ def _ensure_opp(stats: AgentStats, opponent: str) -> None:
 def save_report(report: MatchReport, out_dir: str | Path) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    _cleanup_stale_record_dirs(out)
     records_dir = out / "game_records"
     tmp_records_dir = out / f".game_records.{os.getpid()}.tmp"
     if tmp_records_dir.exists():
@@ -412,6 +420,25 @@ def save_report(report: MatchReport, out_dir: str | Path) -> None:
         raise
     _write_matchup_matrix(report, out / "matchup_matrix.csv")
     _write_agent_intervals(report, out / "agent_intervals.csv")
+
+
+def _cleanup_stale_record_dirs(out: Path) -> None:
+    for path in out.glob(".game_records.*.tmp"):
+        parts = path.name.split(".")
+        if len(parts) < 4:
+            continue
+        try:
+            pid = int(parts[2])
+        except ValueError:
+            continue
+        if pid == os.getpid():
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            shutil.rmtree(path, ignore_errors=True)
+        except PermissionError:
+            continue
 
 
 def _tmp_path(path: Path) -> Path:
