@@ -15,14 +15,14 @@ from tools.reference_pool import ANCHOR_TABLE, default_pool, load_anchor_table, 
 
 TARGET_LB_SCORE = 1200.0
 KEY_ANCHORS = {
-    "i-have-one-rear-card": 0.65,
-    "submission_820": 0.58,
+    "i-have-one-rear-card": 0.70,
+    "submission_820": 0.60,
     "pokemon-ai-battle-best-ptcg-advanced": 0.50,
-    "pokemon-steel": 0.48,
-    "pokemon-tcg-rahul-jiwane": 0.48,
-    "ptcg-mega-lucario-ex-v63": 0.48,
-    "multiply-agent-best-940-lb": 0.48,
-    "submission_sorce_700": 0.65,
+    "pokemon-steel": 0.50,
+    "pokemon-tcg-rahul-jiwane": 0.50,
+    "ptcg-mega-lucario-ex-v63": 0.50,
+    "multiply-agent-best-940-lb": 0.55,
+    "submission_sorce_700": 0.70,
 }
 
 
@@ -128,6 +128,7 @@ def classify_candidate(
     max_no_result_rate: float = 0.01,
     target_lb_score: float | None = None,
     anchor_table: Path = ANCHOR_TABLE,
+    min_matchup_games: int = 0,
 ) -> dict[str, Any]:
     table = load_anchor_table(anchor_table)
     target_lb = float(target_lb_score if target_lb_score is not None else table.get("target_lb_score", TARGET_LB_SCORE))
@@ -147,8 +148,10 @@ def classify_candidate(
         if gate is None:
             continue
         gate.target = target
-        gate.passed = gate.win_rate >= target
+        gate.passed = gate.games >= min_matchup_games and gate.win_rate >= target
         gates.append(gate)
+        if gate.games < min_matchup_games:
+            reasons.append(f"vs {opponent} only {gate.games} games; requires {min_matchup_games}")
         if not gate.passed:
             reasons.append(f"vs {opponent} win_rate {gate.win_rate:.3f} below {target:.3f}")
     covered = {gate.opponent for gate in gates}
@@ -157,8 +160,15 @@ def classify_candidate(
             reasons.append(f"missing required anchor matchup: {required}")
     if incumbent_name in stats and incumbent_name != candidate_name:
         gate = score_rate(row, incumbent_name)
-        if gate is not None and gate.win_rate < 0.52:
-            reasons.append(f"vs incumbent win_rate {gate.win_rate:.3f} below 0.520")
+        if gate is None:
+            reasons.append(f"missing incumbent matchup: {incumbent_name}")
+        else:
+            if gate.games < min_matchup_games:
+                reasons.append(f"vs incumbent only {gate.games} games; requires {min_matchup_games}")
+            if gate.win_rate < 0.55:
+                reasons.append(f"vs incumbent win_rate {gate.win_rate:.3f} below 0.550")
+            if gate.wilson_low < 0.50:
+                reasons.append(f"vs incumbent Wilson lower bound {gate.wilson_low:.3f} below 0.500")
     known_lb = lb_score_for_sha(submission_sha256, anchor_table) if submission_sha256 else None
     if known_lb is not None and known_lb >= target_lb:
         decision = "gold_confirmed"
@@ -203,7 +213,14 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
     save_report(report, args.out)
     candidate_name = submission_name(args.candidate)
     sha = sha256_file(args.candidate) if args.candidate.exists() else ""
-    decision = classify_candidate(report, candidate_name, args.incumbent_name, sha, args.max_no_result_rate)
+    decision = classify_candidate(
+        report,
+        candidate_name,
+        args.incumbent_name,
+        sha,
+        args.max_no_result_rate,
+        min_matchup_games=args.min_matchup_games,
+    )
     result = {
         "out": str(args.out),
         "candidate": str(args.candidate),
@@ -228,7 +245,14 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         raise SystemExit("Missing candidate name; pass --candidate or provide final_report.json with name/best")
     submission = args.submission or Path(str(final.get("submission") or ""))
     sha = sha256_file(submission) if submission.exists() else str(final.get("submission_sha256") or "")
-    decision = classify_candidate(report, candidate, args.incumbent_name, sha, args.max_no_result_rate)
+    decision = classify_candidate(
+        report,
+        candidate,
+        args.incumbent_name,
+        sha,
+        args.max_no_result_rate,
+        min_matchup_games=args.min_matchup_games,
+    )
     result = {
         "out": str(args.out),
         "candidate": candidate,
@@ -258,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     p_diag.add_argument("--record-gzip", action=argparse.BooleanOptionalAction, default=True)
     p_diag.add_argument("--incumbent-name", default="incumbent")
     p_diag.add_argument("--max-no-result-rate", type=float, default=0.01)
+    p_diag.add_argument("--min-matchup-games", type=int, default=500)
 
     p_audit = sub.add_parser("audit", help="Classify an existing discovery/gold final report.")
     p_audit.add_argument("--out", type=Path, default=Path("outputs/gold_gate"))
@@ -267,6 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     p_audit.add_argument("--submission", type=Path)
     p_audit.add_argument("--incumbent-name", default="d001_incumbent")
     p_audit.add_argument("--max-no-result-rate", type=float, default=0.01)
+    p_audit.add_argument("--min-matchup-games", type=int, default=500)
 
     args = parser.parse_args(argv)
     result = diagnose(args) if args.cmd == "diagnose" else audit(args)

@@ -28,6 +28,25 @@ def test_build_config_compatibility_export_uses_canonical_model():
     assert BuildConfig is ModelBuildConfig
 
 
+def test_search_wrapper_embeds_belief_configuration(tmp_path: Path):
+    cfg = BuildConfig(
+        name="belief_wrapper",
+        base=Path("outputs/reference_submissions/i-have-one-rear-card.tar.gz"),
+        out=tmp_path / "belief_wrapper.tar.gz",
+        belief_worlds=6,
+        risk_penalty=0.35,
+        opponent_decks={"test_archetype": [1] * 60},
+    )
+
+    build_submission(cfg)
+    main_py = _read_member(cfg.out, "main.py")
+
+    assert "GT_BELIEF_WORLDS = 6" in main_py
+    assert "GT_RISK_PENALTY = 0.35" in main_py
+    assert "'test_archetype':" in main_py
+    assert "def _gt_sample_hidden_worlds" in main_py
+
+
 def test_deck_rules_apply_swaps_without_build_dependencies():
     original = "\n".join(["1"] * 56 + ["1121"] * 4) + "\n"
 

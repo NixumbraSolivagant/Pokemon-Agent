@@ -1265,6 +1265,8 @@ def agent(obs_dict: dict, configuration=None) -> list[int]:
 
 
 # --- Champion Great Tusk search wrapper injected by tools.build_submission ---
+from collections import Counter as _gt_Counter
+import random as _gt_random
 import time as _gt_time
 
 _GT_SEARCH_OK = False
@@ -1279,6 +1281,9 @@ GT_SEARCH_CANDIDATES = 2
 GT_SEARCH_BUDGET_S = 0.03
 GT_SEARCH_MARGIN = 2400.0
 GT_SEARCH_ROLLOUT_STEPS = 4
+GT_BELIEF_WORLDS = 4
+GT_RISK_PENALTY = 0.20
+GT_OPPONENT_DECKS = {"unknown": read_deck_csv()}
 
 
 def _gt_to_builtin(value):
@@ -1301,12 +1306,76 @@ def _gt_energy_count(pk):
     return len(getattr(pk, "energyCards", None) or getattr(pk, "energies", []) or [])
 
 
-def _gt_hidden_cards(deck, count, fallback):
-    count = max(0, int(count or 0))
-    out = list(deck[:count])
-    while len(out) < count:
-        out.append(fallback)
-    return out
+def _gt_seed(obs, salt=0):
+    current = getattr(obs, "current", None)
+    value = int(getattr(current, "turn", 0) or 0) * 1000003 + int(salt)
+    players = getattr(current, "players", []) if current is not None else []
+    for player in players:
+        for zone in (getattr(player, "active", []), getattr(player, "bench", []), getattr(player, "discard", [])):
+            for card in zone or []:
+                if card is not None:
+                    value = (value * 1009 + int(getattr(card, "id", 0) or 0)) & 0x7FFFFFFF
+    return value
+
+
+def _gt_visible_ids(player):
+    result = []
+    for zone in (getattr(player, "active", []), getattr(player, "bench", []), getattr(player, "discard", [])):
+        result.extend(getattr(card, "id", 0) for card in zone or [] if card is not None)
+    return result
+
+
+def _gt_partition_cards(deck, counts, visible_ids, rng, fallback):
+    available = _gt_Counter(deck)
+    for card_id in visible_ids:
+        if available[card_id] > 0:
+            available[card_id] -= 1
+    pool = [card_id for card_id, quantity in available.items() for _ in range(max(0, quantity))]
+    rng.shuffle(pool)
+    total = sum(max(0, int(count or 0)) for count in counts)
+    while len(pool) < total:
+        pool.append(fallback)
+    result = []
+    cursor = 0
+    for count in counts:
+        count = max(0, int(count or 0))
+        result.append(pool[cursor : cursor + count])
+        cursor += count
+    return result
+
+
+def _gt_sample_hidden_worlds(obs, me, opp, deck, fallback):
+    models = {str(name): list(cards) for name, cards in GT_OPPONENT_DECKS.items() if cards}
+    visible = _gt_visible_ids(opp)
+    ranked = sorted(
+        ((len(set(visible).intersection(cards)), name) for name, cards in models.items()),
+        reverse=True,
+    )
+    selected = [name for score, name in ranked if ranked and score == ranked[0][0] and score > 0]
+    if not selected:
+        selected = ["unknown"]
+    worlds = []
+    for index in range(max(1, int(GT_BELIEF_WORLDS))):
+        rng = _gt_random.Random(_gt_seed(obs, index))
+        opponent_deck = list(models.get(rng.choice(selected), deck))
+        own_hidden, own_prize = _gt_partition_cards(
+            deck,
+            (me.deckCount, len(me.prize)),
+            _gt_visible_ids(me),
+            rng,
+            fallback,
+        )
+        opp_deck_hidden, opp_prize, opp_hand = _gt_partition_cards(
+            opponent_deck,
+            (opp.deckCount, len(opp.prize), opp.handCount),
+            visible,
+            rng,
+            fallback,
+        )
+        worlds.append(
+            (own_hidden, own_prize, opp_deck_hidden, opp_prize, opp_hand)
+        )
+    return worlds
 
 
 def _gt_eval_state(obs, me_idx):
@@ -1630,44 +1699,54 @@ def _gt_search_action(obs_dict, obs):
     opp = obs.current.players[1 - me_idx]
     deck = read_deck_csv()
     fallback_basic = GREAT_TUSK
-    try:
-        root = _gt_search_begin(
-            obs,
-            _gt_hidden_cards(deck, me.deckCount, fallback_basic),
-            _gt_hidden_cards(deck, len(me.prize), fallback_basic),
-            _gt_hidden_cards(deck, opp.deckCount, fallback_basic),
-            _gt_hidden_cards(deck, len(opp.prize), fallback_basic),
-            _gt_hidden_cards(deck, opp.handCount, fallback_basic),
-            [fallback_basic] if getattr(opp, "active", None) and opp.active and opp.active[0] is None else [],
-            False,
-        )
-    except Exception:
-        return None
-
     order = _gt_candidate_order(obs, hidx)
     order = order[: max(1, GT_SEARCH_CANDIDATES)]
-    values = {}
     started = _gt_time.perf_counter()
-    try:
-        for idx in order:
-            if _gt_time.perf_counter() - started > GT_SEARCH_BUDGET_S:
-                break
-            try:
-                nxt = _gt_search_step(root.searchId, [idx])
-                end_obs = _gt_rollout_to_turn_boundary(nxt, me_idx, started + GT_SEARCH_BUDGET_S)
-                values[idx] = _gt_eval_state(end_obs, me_idx)
-            except Exception:
-                continue
-    finally:
+    deadline = started + GT_SEARCH_BUDGET_S
+    values = {idx: [] for idx in order}
+    for own_deck, own_prize, opp_deck, opp_prize, opp_hand in _gt_sample_hidden_worlds(obs, me, opp, deck, fallback_basic):
+        if _gt_time.perf_counter() >= deadline:
+            break
         try:
-            _gt_search_end()
+            root = _gt_search_begin(
+                obs,
+                own_deck,
+                own_prize,
+                opp_deck,
+                opp_prize,
+                opp_hand,
+                [fallback_basic] if getattr(opp, "active", None) and opp.active and opp.active[0] is None else [],
+                False,
+            )
         except Exception:
-            pass
-    if not values:
+            continue
+        try:
+            for idx in order:
+                if _gt_time.perf_counter() >= deadline:
+                    break
+                try:
+                    nxt = _gt_search_step(root.searchId, [idx])
+                    end_obs = _gt_rollout_to_turn_boundary(nxt, me_idx, deadline)
+                    values[idx].append(_gt_eval_state(end_obs, me_idx))
+                except Exception:
+                    continue
+        finally:
+            try:
+                _gt_search_end()
+            except Exception:
+                pass
+    aggregates = {}
+    for idx, samples in values.items():
+        if not samples:
+            continue
+        mean = sum(samples) / len(samples)
+        variance = sum((value - mean) ** 2 for value in samples) / len(samples)
+        aggregates[idx] = mean - GT_RISK_PENALTY * variance ** 0.5
+    if not aggregates:
         return None
-    hval = values.get(hidx, -1.0e18)
-    best = max(values, key=lambda i: values[i])
-    if best != hidx and values[best] > hval + GT_SEARCH_MARGIN:
+    hval = aggregates.get(hidx, -1.0e18)
+    best = max(aggregates, key=lambda i: aggregates[i])
+    if best != hidx and aggregates[best] > hval + GT_SEARCH_MARGIN:
         return [best]
     return heuristic
 

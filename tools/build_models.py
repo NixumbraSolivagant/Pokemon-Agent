@@ -20,6 +20,9 @@ class BuildConfig:
     search_budget_s: float = 0.25
     search_margin: float = 1200.0
     search_rollout_steps: int = 16
+    belief_worlds: int = 4
+    risk_penalty: float = 0.20
+    opponent_decks: dict[str, list[int]] = field(default_factory=dict)
     deck_swaps: list[tuple[int, int]] = field(default_factory=list)
     deck_override: list[int] | None = None
     deck_files: tuple[str, ...] = ("deck.csv",)

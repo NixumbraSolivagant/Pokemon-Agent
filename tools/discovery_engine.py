@@ -102,7 +102,7 @@ def profile_from_name(name: str) -> DiscoveryProfile:
             stage_a=Stage("stage_a", 2, 144, 8, "none", 36),
             stage_b=Stage("stage_b", 24, 40, 8, "sample", 16),
             stage_c=Stage("stage_c_confirm", 80, 18, 10, "losses", 8),
-            stage_d=Stage("stage_d_holdout", 160, 8, 12, "losses", 5),
+            stage_d=Stage("stage_d_holdout", 500, 8, 12, "losses", 5),
             manual_slots=8,
             max_no_result_rate=0.01,
             min_holdout_score_delta=8.0,
@@ -122,7 +122,7 @@ def profile_from_name(name: str) -> DiscoveryProfile:
         stage_a=Stage("stage_a", 2, 224, 10, "none", 56),
         stage_b=Stage("stage_b", 32, 72, 10, "sample", 24),
         stage_c=Stage("stage_c_confirm", 96, 28, 12, "losses", 10),
-        stage_d=Stage("stage_d_holdout", 192, 10, 14, "losses", 6),
+        stage_d=Stage("stage_d_holdout", 500, 10, 14, "losses", 6),
         manual_slots=10,
         max_no_result_rate=0.01,
         min_holdout_score_delta=8.0,
@@ -1270,6 +1270,7 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
             incumbent_name=incumbent_name,
             submission_sha256=str(final.get("submission_sha256") or ""),
             max_no_result_rate=profile.max_no_result_rate,
+            min_matchup_games=500,
         )
         final["gold_gate"] = gold_decision
         decision = {

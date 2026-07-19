@@ -16,6 +16,8 @@ from tools.export_kaggle_submission import export_kaggle_submission
 SEARCH_INJECTION = r'''
 
 # --- Champion Great Tusk search wrapper injected by tools.build_submission ---
+from collections import Counter as _gt_Counter
+import random as _gt_random
 import time as _gt_time
 
 _GT_SEARCH_OK = False
@@ -30,9 +32,12 @@ GT_SEARCH_CANDIDATES = __GT_SEARCH_CANDIDATES__
 GT_SEARCH_BUDGET_S = __GT_SEARCH_BUDGET_S__
 GT_SEARCH_MARGIN = __GT_SEARCH_MARGIN__
 GT_SEARCH_ROLLOUT_STEPS = __GT_SEARCH_ROLLOUT_STEPS__
+GT_BELIEF_WORLDS = __GT_BELIEF_WORLDS__
+GT_RISK_PENALTY = __GT_RISK_PENALTY__
 GT_STRATEGY_WEIGHTS = __GT_STRATEGY_WEIGHTS__
 GT_POLICY_VARIANT = "__GT_POLICY_VARIANT__"
 GT_OPPONENT_MODEL = "__GT_OPPONENT_MODEL__"
+GT_OPPONENT_DECKS = __GT_OPPONENT_DECKS__
 
 
 def _gt_weight(name, default):
@@ -68,12 +73,76 @@ def _gt_energy_count(pk):
     return len(getattr(pk, "energyCards", None) or getattr(pk, "energies", []) or [])
 
 
-def _gt_hidden_cards(deck, count, fallback):
-    count = max(0, int(count or 0))
-    out = list(deck[:count])
-    while len(out) < count:
-        out.append(fallback)
-    return out
+def _gt_seed(obs, salt=0):
+    current = getattr(obs, "current", None)
+    value = int(getattr(current, "turn", 0) or 0) * 1000003 + int(salt)
+    players = getattr(current, "players", []) if current is not None else []
+    for player in players:
+        for zone in (getattr(player, "active", []), getattr(player, "bench", []), getattr(player, "discard", [])):
+            for card in zone or []:
+                if card is not None:
+                    value = (value * 1009 + int(getattr(card, "id", 0) or 0)) & 0x7FFFFFFF
+    return value
+
+
+def _gt_visible_ids(player):
+    result = []
+    for zone in (getattr(player, "active", []), getattr(player, "bench", []), getattr(player, "discard", [])):
+        result.extend(getattr(card, "id", 0) for card in zone or [] if card is not None)
+    return result
+
+
+def _gt_partition_cards(deck, counts, visible_ids, rng, fallback):
+    available = _gt_Counter(deck)
+    for card_id in visible_ids:
+        if available[card_id] > 0:
+            available[card_id] -= 1
+    pool = [card_id for card_id, quantity in available.items() for _ in range(max(0, quantity))]
+    rng.shuffle(pool)
+    total = sum(max(0, int(count or 0)) for count in counts)
+    while len(pool) < total:
+        pool.append(fallback)
+    result = []
+    cursor = 0
+    for count in counts:
+        count = max(0, int(count or 0))
+        result.append(pool[cursor : cursor + count])
+        cursor += count
+    return result
+
+
+def _gt_sample_hidden_worlds(obs, me, opp, deck, fallback):
+    models = {str(name): list(cards) for name, cards in GT_OPPONENT_DECKS.items() if cards}
+    visible = _gt_visible_ids(opp)
+    ranked = sorted(
+        ((len(set(visible).intersection(cards)), name) for name, cards in models.items()),
+        reverse=True,
+    )
+    selected = [name for score, name in ranked if ranked and score == ranked[0][0] and score > 0]
+    if not selected:
+        selected = ["unknown"]
+    worlds = []
+    for index in range(max(1, int(GT_BELIEF_WORLDS))):
+        rng = _gt_random.Random(_gt_seed(obs, index))
+        opponent_deck = list(models.get(rng.choice(selected), deck))
+        own_hidden, own_prize = _gt_partition_cards(
+            deck,
+            (me.deckCount, len(me.prize)),
+            _gt_visible_ids(me),
+            rng,
+            fallback,
+        )
+        opp_deck_hidden, opp_prize, opp_hand = _gt_partition_cards(
+            opponent_deck,
+            (opp.deckCount, len(opp.prize), opp.handCount),
+            visible,
+            rng,
+            fallback,
+        )
+        worlds.append(
+            (own_hidden, own_prize, opp_deck_hidden, opp_prize, opp_hand)
+        )
+    return worlds
 
 
 def _gt_eval_state(obs, me_idx):
@@ -405,44 +474,55 @@ def _gt_search_action(obs_dict, obs):
     opp = obs.current.players[1 - me_idx]
     deck = read_deck_csv()
     fallback_basic = GREAT_TUSK
-    try:
-        root = _gt_search_begin(
-            obs,
-            _gt_hidden_cards(deck, me.deckCount, fallback_basic),
-            _gt_hidden_cards(deck, len(me.prize), fallback_basic),
-            _gt_hidden_cards(deck, opp.deckCount, fallback_basic),
-            _gt_hidden_cards(deck, len(opp.prize), fallback_basic),
-            _gt_hidden_cards(deck, opp.handCount, fallback_basic),
-            [fallback_basic] if getattr(opp, "active", None) and opp.active and opp.active[0] is None else [],
-            False,
-        )
-    except Exception:
-        return None
-
     order = _gt_candidate_order(obs, hidx)
     order = order[: max(1, GT_SEARCH_CANDIDATES)]
-    values = {}
     started = _gt_time.perf_counter()
-    try:
-        for idx in order:
-            if _gt_time.perf_counter() - started > GT_SEARCH_BUDGET_S:
-                break
-            try:
-                nxt = _gt_search_step(root.searchId, [idx])
-                end_obs = _gt_rollout_to_turn_boundary(nxt, me_idx, started + GT_SEARCH_BUDGET_S)
-                values[idx] = _gt_eval_state(end_obs, me_idx)
-            except Exception:
-                continue
-    finally:
+    deadline = started + GT_SEARCH_BUDGET_S
+    values = {idx: [] for idx in order}
+    worlds = _gt_sample_hidden_worlds(obs, me, opp, deck, fallback_basic)
+    for own_deck, own_prize, opp_deck, opp_prize, opp_hand in worlds:
+        if _gt_time.perf_counter() >= deadline:
+            break
         try:
-            _gt_search_end()
+            root = _gt_search_begin(
+                obs,
+                own_deck,
+                own_prize,
+                opp_deck,
+                opp_prize,
+                opp_hand,
+                [fallback_basic] if getattr(opp, "active", None) and opp.active and opp.active[0] is None else [],
+                False,
+            )
         except Exception:
-            pass
-    if not values:
+            continue
+        try:
+            for idx in order:
+                if _gt_time.perf_counter() >= deadline:
+                    break
+                try:
+                    nxt = _gt_search_step(root.searchId, [idx])
+                    end_obs = _gt_rollout_to_turn_boundary(nxt, me_idx, deadline)
+                    values[idx].append(_gt_eval_state(end_obs, me_idx))
+                except Exception:
+                    continue
+        finally:
+            try:
+                _gt_search_end()
+            except Exception:
+                pass
+    aggregates = {}
+    for idx, samples in values.items():
+        if not samples:
+            continue
+        mean = sum(samples) / len(samples)
+        variance = sum((value - mean) ** 2 for value in samples) / len(samples)
+        aggregates[idx] = mean - float(GT_RISK_PENALTY) * variance ** 0.5
+    if not aggregates:
         return None
-    hval = values.get(hidx, -1.0e18)
-    best = max(values, key=lambda i: values[i])
-    if best != hidx and values[best] > hval + GT_SEARCH_MARGIN:
+    hval = aggregates.get(hidx, -1.0e18)
+    best = max(aggregates, key=lambda i: aggregates[i])
+    if best != hidx and aggregates[best] > hval + GT_SEARCH_MARGIN:
         return [best]
     return heuristic
 
@@ -482,6 +562,41 @@ def load_config(path: Path | None) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _read_deck_from_archive(path: Path) -> list[int]:
+    if not path.exists():
+        return []
+    try:
+        with tarfile.open(path, "r:gz") as tar:
+            member = tar.getmember("deck.csv")
+            payload = tar.extractfile(member)
+            if payload is None:
+                return []
+            return [int(line) for line in payload.read().decode("utf-8").splitlines() if line.strip()]
+    except (KeyError, OSError, ValueError, tarfile.TarError):
+        return []
+
+
+def _resolved_opponent_decks(cfg: BuildConfig) -> dict[str, list[int]]:
+    if cfg.opponent_decks:
+        return {str(name): list(deck) for name, deck in cfg.opponent_decks.items() if deck}
+    paths = {
+        "great_tusk": Path("outputs/reference_submissions/i-have-one-rear-card.tar.gz"),
+        "advanced": Path("outputs/reference_submissions/pokemon-ai-battle-best-ptcg-advanced.tar.gz"),
+        "metal_tempo": Path("outputs/reference_submissions/pokemon-steel.tar.gz"),
+        "rahul_metal": Path("outputs/reference_submissions/pokemon-tcg-rahul-jiwane.tar.gz"),
+        "lucario": Path("outputs/reference_submissions/ptcg-mega-lucario-ex-v63.tar.gz"),
+        "probabilistic": Path("outputs/reference_submissions/improved-probabilistic-agent.tar.gz"),
+        "multiply_940": Path("outputs/reference_submissions/multiply-agent-best-940-lb.tar.gz"),
+    }
+    resolved = {name: deck for name, path in paths.items() if (deck := _read_deck_from_archive(path))}
+    if resolved:
+        return resolved
+    local_deck = Path("deck.csv")
+    if local_deck.exists():
+        return {"unknown": [int(line) for line in local_deck.read_text(encoding="utf-8").splitlines() if line.strip()]}
+    return {}
+
+
 def make_config(args: argparse.Namespace) -> BuildConfig:
     data = load_config(args.config)
     deck_swaps = [tuple(map(int, pair)) for pair in data.get("deck_swaps", [])]
@@ -503,6 +618,12 @@ def make_config(args: argparse.Namespace) -> BuildConfig:
         search_budget_s=float(data.get("search_budget_s", args.search_budget_s)),
         search_margin=float(data.get("search_margin", args.search_margin)),
         search_rollout_steps=int(data.get("search_rollout_steps", args.search_rollout_steps)),
+        belief_worlds=int(data.get("belief_worlds", args.belief_worlds)),
+        risk_penalty=float(data.get("risk_penalty", args.risk_penalty)),
+        opponent_decks={
+            str(name): [int(card_id) for card_id in deck]
+            for name, deck in dict(data.get("opponent_decks", {})).items()
+        },
         deck_swaps=deck_swaps,
         deck_override=deck_override,
         deck_files=tuple(data.get("deck_files", ("deck.csv",))),
@@ -528,9 +649,12 @@ def build_main(original: str, cfg: BuildConfig) -> str:
         .replace("__GT_SEARCH_BUDGET_S__", repr(cfg.search_budget_s))
         .replace("__GT_SEARCH_MARGIN__", repr(cfg.search_margin))
         .replace("__GT_SEARCH_ROLLOUT_STEPS__", str(cfg.search_rollout_steps))
+        .replace("__GT_BELIEF_WORLDS__", str(cfg.belief_worlds))
+        .replace("__GT_RISK_PENALTY__", repr(cfg.risk_penalty))
         .replace("__GT_STRATEGY_WEIGHTS__", repr(dict(cfg.strategy_weights)))
         .replace("__GT_POLICY_VARIANT__", cfg.policy_variant.replace("\\", "\\\\").replace('"', '\\"'))
         .replace("__GT_OPPONENT_MODEL__", cfg.opponent_model.replace("\\", "\\\\").replace('"', '\\"'))
+        .replace("__GT_OPPONENT_DECKS__", repr(_resolved_opponent_decks(cfg)))
     )
     return original.rstrip() + "\n" + injection.lstrip()
 
@@ -547,6 +671,9 @@ def build_submission(cfg: BuildConfig) -> Path:
         "search_budget_s": cfg.search_budget_s,
         "search_margin": cfg.search_margin,
         "search_rollout_steps": cfg.search_rollout_steps,
+        "belief_worlds": cfg.belief_worlds,
+        "risk_penalty": cfg.risk_penalty,
+        "opponent_deck_models": sorted(_resolved_opponent_decks(cfg)),
         "deck_swaps": cfg.deck_swaps,
         "deck_override": cfg.deck_override,
         "deck_files": list(cfg.deck_files),
@@ -592,6 +719,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--search-budget-s", type=float, default=0.25)
     parser.add_argument("--search-margin", type=float, default=1200.0)
     parser.add_argument("--search-rollout-steps", type=int, default=16)
+    parser.add_argument("--belief-worlds", type=int, default=4)
+    parser.add_argument("--risk-penalty", type=float, default=0.20)
     parser.add_argument("--include-build-metadata", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--export-kaggle-submission", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--submission-out", type=Path, default=Path("outputs/submissions/submission.tar.gz"))
