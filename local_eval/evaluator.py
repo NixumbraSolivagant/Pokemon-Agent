@@ -54,6 +54,79 @@ def run_ladder(
     config: EvalConfig,
     project_root: str | Path,
 ) -> MatchReport:
+    pair_indices = [
+        (first, second)
+        for first in range(len(tarballs))
+        for second in range(first + 1, len(tarballs))
+    ]
+    return _run_indexed_schedule(
+        tarballs,
+        pair_indices,
+        games_per_pair,
+        config,
+        project_root,
+        schedule_name="full_ladder",
+    )
+
+
+def candidate_pool_schedule(candidate_count: int, opponent_count: int, peer_span: int = 1) -> list[tuple[int, int]]:
+    pairs: set[tuple[int, int]] = set()
+    opponent_offset = candidate_count
+    for candidate in range(candidate_count):
+        for opponent in range(opponent_count):
+            pairs.add((candidate, opponent_offset + opponent))
+    if candidate_count > 1:
+        for candidate in range(candidate_count):
+            for distance in range(1, min(max(0, peer_span), candidate_count - 1) + 1):
+                peer = (candidate + distance) % candidate_count
+                pairs.add(tuple(sorted((candidate, peer))))
+    return sorted(pairs)
+
+
+def run_candidate_pool(
+    candidate_tarballs: list[str | Path],
+    opponent_tarballs: list[str | Path],
+    games_per_pair: int,
+    config: EvalConfig,
+    project_root: str | Path,
+    peer_span: int = 1,
+) -> MatchReport:
+    candidates = _unique_paths(candidate_tarballs)
+    candidate_paths = {path.resolve() for path in candidates}
+    opponents = [path for path in _unique_paths(opponent_tarballs) if path.resolve() not in candidate_paths]
+    tarballs: list[str | Path] = [*candidates, *opponents]
+    pair_indices = candidate_pool_schedule(len(candidates), len(opponents), peer_span=peer_span)
+    return _run_indexed_schedule(
+        tarballs,
+        pair_indices,
+        games_per_pair,
+        config,
+        project_root,
+        schedule_name="candidate_pool",
+    )
+
+
+def _unique_paths(paths: list[str | Path]) -> list[Path]:
+    unique: list[Path] = []
+    seen: set[Path] = set()
+    for value in paths:
+        path = Path(value)
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(path)
+    return unique
+
+
+def _run_indexed_schedule(
+    tarballs: list[str | Path],
+    pair_indices: list[tuple[int, int]],
+    games_per_pair: int,
+    config: EvalConfig,
+    project_root: str | Path,
+    schedule_name: str,
+) -> MatchReport:
     infos = build_submission_info(tarballs)
     names = list(infos)
     rating = KaggleStyleRating(config)
@@ -73,21 +146,23 @@ def run_ladder(
     game_results: list[GameResult] = []
     jobs: list[tuple[int, str, str, int, str]] = []
     game_no = 0
-    for i, name_a in enumerate(names):
-        for name_b in names[i + 1 :]:
-            for local_idx in range(games_per_pair):
-                swap = local_idx % 2 == 1
-                p0_name, p1_name = (name_b, name_a) if swap else (name_a, name_b)
-                seed = config.seed + game_no
-                game_id = f"g{game_no:06d}"
-                jobs.append((game_no, p0_name, p1_name, seed, game_id))
-                game_no += 1
+    for first, second in pair_indices:
+        if first < 0 or second < 0 or first >= len(names) or second >= len(names) or first == second:
+            raise ValueError(f"Invalid matchup pair: {(first, second)} for {len(names)} submissions")
+        name_a, name_b = names[first], names[second]
+        for local_idx in range(games_per_pair):
+            swap = local_idx % 2 == 1
+            p0_name, p1_name = (name_b, name_a) if swap else (name_a, name_b)
+            seed = config.seed + game_no
+            game_id = f"g{game_no:06d}"
+            jobs.append((game_no, p0_name, p1_name, seed, game_id))
+            game_no += 1
     _progress(
         config,
         "start",
         done=0,
         total=len(jobs),
-        extra=f"agents={len(names)} games_per_pair={games_per_pair} workers={config.workers}",
+        extra=f"schedule={schedule_name} agents={len(names)} pairs={len(pair_indices)} games_per_pair={games_per_pair} workers={config.workers}",
         force=True,
     )
 
@@ -160,12 +235,20 @@ def run_ladder(
         key=lambda s: (s.kaggle_score_estimate, s.mu, s.wins - s.losses, -s.losses),
         reverse=True,
     )
+    metadata = _metadata(project_root)
+    metadata.update(
+        {
+            "schedule": schedule_name,
+            "scheduled_pairs": len(pair_indices),
+            "games_per_pair": games_per_pair,
+        }
+    )
     return MatchReport(
         config=config,
         submissions=list(infos.values()),
         games=game_results,
         standings=standings,
-        metadata=_metadata(project_root),
+        metadata=metadata,
     )
 
 

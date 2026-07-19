@@ -63,6 +63,12 @@ artifacts identify meta-strategy targets, vulnerable candidates, and uncertain
 matchups for the next generation. Final discovery exports distinct generalist,
 anti-fast-KO, and anti-control candidates when enough clean finalists exist.
 
+Discovery evaluation uses a scheduled candidate-pool graph rather than a full
+round robin. Every candidate plays the selected baseline/counter-opponent pool,
+plus a sparse ring of candidate peers. Baselines never play other baselines and
+counter opponents never play one another. Confirmation stages sample traces
+instead of recording every decisive loss.
+
 ## Validation
 
 Run the focused validation sequence after structural changes:

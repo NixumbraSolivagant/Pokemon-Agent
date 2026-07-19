@@ -43,6 +43,10 @@ def test_turbo_discovery_profile_uses_auto_workers_and_larger_population():
     assert turbo.workers == 0
     assert turbo.population > normal.population
     assert turbo.stage_b.candidate_limit > normal.stage_b.candidate_limit
+    assert turbo.stage_c.games_per_pair == 64
+    assert turbo.stage_c.record_mode == "sample"
+    assert turbo.stage_d.games_per_pair == 256
+    assert turbo.stage_d.record_mode == "sample"
 
 
 def test_reference_pool_includes_submission_820_and_baselines():

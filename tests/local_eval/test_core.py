@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 
 from local_eval.archive import SubmissionArchiveError, safe_extract_tar_gz
-from local_eval.evaluator import run_match, save_report
+from local_eval.evaluator import candidate_pool_schedule, run_match, save_report
 from local_eval.models import EvalConfig, GameResult
 from local_eval.rating import KaggleStyleRating
 from local_eval.referee import InvalidAction, _should_keep_trace, validate_action, validate_deck
@@ -267,3 +267,12 @@ def test_run_match_can_write_progress_file(tmp_path: Path, capsys):
     assert output == ""
     assert "[file_progress] games" in progress
     assert "1/1" in progress
+
+
+def test_candidate_pool_schedule_excludes_opponent_self_play():
+    pairs = candidate_pool_schedule(candidate_count=4, opponent_count=3, peer_span=1)
+
+    assert len(pairs) == 16
+    assert sum(first < 4 <= second for first, second in pairs) == 12
+    assert sum(first < 4 and second < 4 for first, second in pairs) == 4
+    assert not any(first >= 4 and second >= 4 for first, second in pairs)

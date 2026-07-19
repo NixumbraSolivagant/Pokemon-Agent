@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from local_eval.archive import sha256_file
-from local_eval.evaluator import run_ladder, save_report
+from local_eval.evaluator import run_candidate_pool, save_report, submission_name
 from local_eval.models import AgentStats, EvalConfig, MatchReport
 from tools.build_models import BuildConfig
 from tools.build_submission import build_submission
@@ -102,10 +102,10 @@ def profile_from_name(name: str) -> DiscoveryProfile:
             workers=0,
             max_actions=1000,
             run_timeout_s=180.0,
-            stage_a=Stage("stage_a", 8, 96, 8, "none", 32),
-            stage_b=Stage("stage_b", 32, 32, 8, "sample", 12),
-            stage_c=Stage("stage_c_confirm", 128, 12, 10, "losses", 6),
-            stage_d=Stage("stage_d_holdout", 512, 4, 12, "losses", 4),
+            stage_a=Stage("stage_a", 4, 96, 8, "none", 32),
+            stage_b=Stage("stage_b", 16, 32, 8, "sample", 12),
+            stage_c=Stage("stage_c_confirm", 64, 12, 10, "sample", 6),
+            stage_d=Stage("stage_d_holdout", 256, 4, 12, "sample", 4),
             manual_slots=8,
             max_no_result_rate=0.01,
             min_holdout_score_delta=8.0,
@@ -122,10 +122,10 @@ def profile_from_name(name: str) -> DiscoveryProfile:
         workers=0,
         max_actions=1000,
         run_timeout_s=180.0,
-            stage_a=Stage("stage_a", 8, 96, 10, "none", 32),
-            stage_b=Stage("stage_b", 32, 40, 10, "sample", 12),
-            stage_c=Stage("stage_c_confirm", 128, 12, 12, "losses", 6),
-            stage_d=Stage("stage_d_holdout", 512, 4, 14, "losses", 4),
+            stage_a=Stage("stage_a", 4, 96, 10, "none", 32),
+            stage_b=Stage("stage_b", 16, 40, 10, "sample", 12),
+            stage_c=Stage("stage_c_confirm", 64, 12, 12, "sample", 6),
+            stage_d=Stage("stage_d_holdout", 256, 4, 14, "sample", 4),
         manual_slots=10,
         max_no_result_rate=0.01,
         min_holdout_score_delta=8.0,
@@ -864,7 +864,8 @@ def eval_stage(
     if incumbent_name in by_name:
         ordered_names = [incumbent_name] + ordered_names
     selected_records = [by_name[name] for name in ordered_names[: stage.candidate_limit]]
-    tarballs = unique_existing([Path(r.eval_tarball) for r in selected_records] + pool[: stage.pool_limit])
+    candidate_tarballs = unique_existing([Path(record.eval_tarball) for record in selected_records])
+    opponent_tarballs = unique_existing(pool[: stage.pool_limit])
     cfg = EvalConfig(
         seed=args.seed + seed_offset,
         workers=resolve_workers(args, profile),
@@ -879,7 +880,14 @@ def eval_stage(
         progress_mode=args.progress_mode,
         progress_file=str(out_dir / "progress.txt") if args.progress_mode == "file" else "",
     )
-    report = run_ladder(tarballs, stage.games_per_pair, cfg, Path.cwd())
+    report = run_candidate_pool(
+        candidate_tarballs,
+        opponent_tarballs,
+        stage.games_per_pair,
+        cfg,
+        Path.cwd(),
+        peer_span=0 if "holdout" in stage.name else 1,
+    )
     save_report(report, out_dir / stage.name)
     write_psro(report, out_dir / stage.name / "psro.json", [r.name for r in selected_records])
     next_names = select_next_names(report, selected_records, stage, profile, incumbent_name)
@@ -1042,7 +1050,7 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
     )
     generation_summary = candidate_generation_summary(configs, requested_population, len(records))
     write_json(gen_dir / "candidate_generation.json", generation_summary)
-    incumbent_name = f"d{generation:03d}_incumbent"
+    incumbent_name = submission_name(incumbent_tarball)
     all_names = [record.name for record in records]
     pool_manifest = write_pool_manifest(gen_dir / "pool_manifest.json", incumbent_tarball, unique_existing(args.pool), hof_paths, profile.stage_d.pool_limit)
     pools = pool_paths_by_role(pool_manifest)
@@ -1118,7 +1126,6 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
             failures_out=gen_dir / "microburst" / "build_failures.json",
         )
         if microburst_records:
-            micro_incumbent = f"d{micro_generation:03d}_incumbent"
             micro_stage = Stage(
                 "stage_b_microburst",
                 max(1, profile.stage_b.games_per_pair // 2),
@@ -1137,7 +1144,7 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
                 profile,
                 args,
                 generation * 10000 + 252,
-                micro_incumbent,
+                incumbent_name,
             )
             microburst_names = [name for name in micro_names if name != micro_incumbent]
             records.extend([record for record in microburst_records if record.name != micro_incumbent])
@@ -1328,7 +1335,7 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
             incumbent_name=incumbent_name,
             submission_sha256=str(final.get("submission_sha256") or ""),
             max_no_result_rate=profile.max_no_result_rate,
-            min_matchup_games=500,
+            min_matchup_games=profile.stage_d.games_per_pair,
         )
         final["gold_gate"] = gold_decision
         decision = {
