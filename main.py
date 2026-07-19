@@ -1,5 +1,6 @@
 import os
 from collections import defaultdict
+from pathlib import Path
 
 from cg.api import (
     AreaType, CardType, Observation, OptionType, Pokemon,
@@ -108,10 +109,13 @@ EX_EVOLUTION_ANCESTORS = _ex_evolution_ancestor_names()
 
 
 def read_deck_csv() -> list[int]:
-    path = 'deck.csv'
-    if not os.path.exists(path):
-        path = '/kaggle_simulations/agent/deck.csv'
-    with open(path, 'r') as file:
+    candidates = [
+        Path(__file__).resolve().parent / "deck.csv",
+        Path("deck.csv"),
+        Path("/kaggle_simulations/agent/deck.csv"),
+    ]
+    path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
+    with path.open("r", encoding="utf-8") as file:
         return [int(line) for line in file.read().splitlines()[:60]]
 
 
@@ -1240,6 +1244,16 @@ def _agent(obs_dict: dict) -> list[int]:
     return result
 
 
+def _fallback_action(obs_dict: dict) -> list[int]:
+    select = obs_dict.get("select") if isinstance(obs_dict, dict) else None
+    if select is None:
+        return read_deck_csv()
+    options = select.get("option") or []
+    min_count = max(0, int(select.get("minCount", 0) or 0))
+    max_count = max(0, int(select.get("maxCount", len(options)) or 0))
+    return list(range(min(min_count, max_count, len(options))))
+
+
 def agent(obs_dict: dict, configuration=None) -> list[int]:
     try:
         return _agent(obs_dict)
@@ -1247,13 +1261,9 @@ def agent(obs_dict: dict, configuration=None) -> list[int]:
         if os.environ.get("DEBUG_AGENT") == "1":
             import traceback
             traceback.print_exc()
-        select = obs_dict.get('select') if isinstance(obs_dict, dict) else None
-        if select is None:
-            return read_deck_csv()
-        options = select.get('option') or []
-        min_count = max(0, int(select.get('minCount', 0)))
-        max_count = max(0, int(select.get('maxCount', len(options))))
-        return list(range(min(min_count, max_count, len(options))))
+        return _fallback_action(obs_dict)
+
+
 # --- Champion Great Tusk search wrapper injected by tools.build_submission ---
 import time as _gt_time
 
@@ -1676,12 +1686,7 @@ def agent(obs_dict: dict, configuration=None) -> list[int]:
         if os.environ.get("DEBUG_AGENT") == "1":
             import traceback
             traceback.print_exc()
-        select = obs_dict.get("select") if isinstance(obs_dict, dict) else None
-        if select is None:
-            return read_deck_csv()
-        options = select.get("option") or []
-        min_count = max(0, int(select.get("minCount", 0) or 0))
-        return list(range(min(min_count, len(options))))
+        return _fallback_action(obs_dict)
 
 
 # Kaggle executes main.py and picks the last callable in insertion order.

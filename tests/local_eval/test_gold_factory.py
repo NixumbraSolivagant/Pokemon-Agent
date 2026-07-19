@@ -3,7 +3,9 @@ from __future__ import annotations
 import tarfile
 from pathlib import Path
 
+from tools.build_models import BuildConfig as ModelBuildConfig
 from tools.build_submission import BuildConfig, build_submission
+from tools.deck_rules import apply_deck_swaps, validate_deck_ids
 from tools.export_kaggle_submission import SEARCH_WRAPPER_MARKER, export_kaggle_submission
 from tools.gold_factory import generate_candidate_configs, profile_from_name
 
@@ -20,6 +22,21 @@ def test_smoke_profile_is_small():
     assert profile.population <= 12
     assert profile.stage_a.games_per_pair == 1
     assert profile.manual_slots == 3
+
+
+def test_build_config_compatibility_export_uses_canonical_model():
+    assert BuildConfig is ModelBuildConfig
+
+
+def test_deck_rules_apply_swaps_without_build_dependencies():
+    original = "\n".join(["1"] * 56 + ["1121"] * 4) + "\n"
+
+    swapped = apply_deck_swaps(original, [(1122, 1121)])
+    deck = [int(line) for line in swapped.splitlines()]
+
+    validate_deck_ids(deck)
+    assert deck.count(1121) == 3
+    assert deck.count(1122) == 1
 
 
 def test_lucario_candidate_mutates_both_deck_files(tmp_path: Path):

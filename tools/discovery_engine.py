@@ -14,12 +14,15 @@ from typing import Any
 from local_eval.archive import sha256_file
 from local_eval.evaluator import run_ladder, save_report
 from local_eval.models import AgentStats, EvalConfig, MatchReport
-from tools.build_submission import BuildConfig, build_submission
+from tools.build_models import BuildConfig
+from tools.build_submission import build_submission
 from tools.discovery_feedback import aggregate_feedback, write_pressure_artifacts
 from tools.discovery_space import generate_discovery_configs, read_build_metadata
 from tools.export_kaggle_submission import export_kaggle_submission
+from tools.gold_gate import classify_candidate as classify_gold_candidate
 from tools.loss_mining import digest_loss_files, digest_scenarios, load_scenarios as load_loss_scenarios, mine_losses
 from tools.psro import psro_bonus_names, write_psro
+from tools.reference_pool import DEFAULT_REFERENCE_PATHS
 from tools.scenario_eval import run_scenarios
 
 
@@ -27,16 +30,7 @@ DEFAULT_OUT = Path("outputs/discovery_gold")
 DEFAULT_INCUMBENT = Path("outputs/submissions/champion_latest.tar.gz")
 DEFAULT_PROMOTE = Path("outputs/submissions/champion_discovery.tar.gz")
 DEFAULT_SUBMISSION = Path("outputs/submissions/submission_discovery.tar.gz")
-DEFAULT_POOL = [
-    Path("outputs/reference_submissions/i-have-one-rear-card.tar.gz"),
-    Path("outputs/reference_submissions/pokemon-steel.tar.gz"),
-    Path("outputs/reference_submissions/pokemon-tcg-rahul-jiwane.tar.gz"),
-    Path("outputs/reference_submissions/improved-probabilistic-agent.tar.gz"),
-    Path("outputs/reference_submissions/ptcg-mega-lucario-ex-v63.tar.gz"),
-    Path("outputs/reference_submissions/multiply-agent-best-940-lb.tar.gz"),
-    Path("outputs/reference_submissions/pokemon-ai-battle-best-ptcg-advanced.tar.gz"),
-    Path("基准/submission_sorce_700.tar.gz"),
-]
+DEFAULT_POOL = DEFAULT_REFERENCE_PATHS
 
 
 @dataclass(slots=True)
@@ -468,7 +462,7 @@ def classify_final(
         return {"champion_class": "portfolio_candidate", "decision": "hold_portfolio", "submit_ready": False, "reasons": reasons}
     if not package_ok:
         return {"champion_class": "portfolio_candidate", "decision": "hold_portfolio", "submit_ready": False, "reasons": reasons}
-    return {"champion_class": "strict_champion", "decision": "submit_champion", "submit_ready": True, "reasons": ["strict champion gate passed"]}
+    return {"champion_class": "strict_champion", "decision": "gold_gate_required", "submit_ready": False, "reasons": ["strict incumbent gate passed; gold gate still required"]}
 
 
 def write_decision_brief(out: Path, final: dict[str, Any], decision: dict[str, Any], submission_check: dict[str, Any] | None = None) -> None:
@@ -482,6 +476,7 @@ def write_decision_brief(out: Path, final: dict[str, Any], decision: dict[str, A
         f"- candidate: `{final.get('name') or final.get('best', '')}`",
         f"- score_delta_vs_incumbent: `{final.get('score_delta_vs_incumbent')}`",
         f"- h2h: `{final.get('h2h_wins', 0)}-{final.get('h2h_losses', 0)}`",
+        f"- score_warning: `local_trueskill_score is not Kaggle leaderboard score`",
         "",
         "## Reasons",
     ]
@@ -499,6 +494,27 @@ def write_decision_brief(out: Path, final: dict[str, Any], decision: dict[str, A
                 f"- error: `{submission_check.get('error')}`",
             ]
         )
+    gold_gate = final.get("gold_gate") or {}
+    if isinstance(gold_gate, dict) and gold_gate:
+        lines.extend(
+            [
+                "",
+                "## Gold Gate",
+                f"- decision: `{gold_gate.get('decision')}`",
+                f"- gold_gate_passed: `{gold_gate.get('gold_gate_passed')}`",
+                f"- target_lb_score: `{gold_gate.get('target_lb_score')}`",
+                f"- known_lb_score: `{gold_gate.get('known_lb_score')}`",
+                f"- submission_sha256: `{gold_gate.get('submission_sha256')}`",
+            ]
+        )
+        for reason in gold_gate.get("reasons", []):
+            lines.append(f"- {reason}")
+        for gate in gold_gate.get("matchup_gates", [])[:12]:
+            if isinstance(gate, dict):
+                lines.append(
+                    f"- vs `{gate.get('opponent')}` win_rate=`{gate.get('win_rate')}` "
+                    f"target=`{gate.get('target')}` passed=`{gate.get('passed')}`"
+                )
     feedback = final.get("generation_feedback") or {}
     if isinstance(feedback, dict):
         lines.extend(
@@ -540,7 +556,7 @@ def write_decision_brief(out: Path, final: dict[str, Any], decision: dict[str, A
         if not isinstance(row, dict):
             continue
         lines.append(
-            f"- `{row.get('name')}` score=`{row.get('kaggle_score_estimate')}` "
+            f"- `{row.get('name')}` local_trueskill_score=`{row.get('kaggle_score_estimate')}` "
             f"wl=`{row.get('wins')}-{row.get('losses')}` no_results=`{row.get('no_results')}`"
         )
     lines.append("")
@@ -588,6 +604,67 @@ def feedback_path_for_run(args: argparse.Namespace) -> Path | None:
     if explicit:
         return explicit
     return args.out / "generation_feedback.json"
+
+
+def _record_value(record: CandidateRecord | dict[str, Any], key: str) -> Any:
+    if isinstance(record, dict):
+        return record.get(key)
+    return getattr(record, key, None)
+
+
+def resolve_feedback_target_paths(feedback: dict[str, Any], records: list[CandidateRecord | dict[str, Any]], limit: int = 16) -> list[Path]:
+    pressure_items = [item for item in feedback.get("pressure_items", []) if isinstance(item, dict)]
+    if not pressure_items:
+        return []
+
+    by_name: dict[str, Path] = {}
+    by_family: dict[str, list[Path]] = {}
+    for record in records:
+        name = str(_record_value(record, "name") or "")
+        family = str(_record_value(record, "family") or "")
+        tarball = (
+            _record_value(record, "internal_tarball")
+            or _record_value(record, "tarball")
+            or _record_value(record, "eval_tarball")
+        )
+        if not name or not tarball:
+            continue
+        path = Path(str(tarball))
+        if not path.exists():
+            continue
+        resolved = path.resolve()
+        by_name[name] = resolved
+        if family:
+            by_family.setdefault(family, []).append(resolved)
+
+    out: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(path: Path) -> None:
+        if path in seen or len(out) >= limit:
+            return
+        seen.add(path)
+        out.append(path)
+
+    for item in pressure_items:
+        target = str(item.get("target_candidate") or "")
+        if target in by_name:
+            add(by_name[target])
+        family = str(item.get("target_family") or "")
+        if family and family != "unknown":
+            for path in by_family.get(family, [])[:2]:
+                add(path)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def history_records(state: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    for row in reversed(state.get("history", [])):
+        final = row.get("final") or {}
+        records.extend(record for record in final.get("records", []) if isinstance(record, dict))
+    return records
 
 
 def build_generation_feedback(
@@ -883,6 +960,8 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
     hof_paths = hof_paths_from_state(state)
     digest_path = args.loss_digest if args.loss_digest else args.out / "loss_digest.json"
     feedback_path = feedback_path_for_run(args)
+    previous_feedback = read_json(feedback_path) if feedback_path and feedback_path.exists() else {}
+    target_paths = resolve_feedback_target_paths(previous_feedback, history_records(state))
     requested_population = args.population or profile.population
     set_run_phase(state, args.out, generation, "build", "generating candidate configs")
     configs = generate_discovery_configs(
@@ -895,6 +974,7 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
         include_portfolio=args.include_portfolio,
         loss_digest_path=digest_path if digest_path.exists() else None,
         feedback_path=feedback_path if feedback_path and feedback_path.exists() else None,
+        target_paths=target_paths,
         min_diversity_distance=args.min_diversity_distance,
     )
     generation_summary = candidate_generation_summary(configs, requested_population)
@@ -965,6 +1045,7 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
         microburst=True,
         previous_feedback=feedback_path if feedback_path and feedback_path.exists() else None,
     )
+    microburst_target_paths = resolve_feedback_target_paths(microburst_feedback, records)
     microburst_records: list[CandidateRecord] = []
     microburst_names: list[str] = []
     if (
@@ -984,6 +1065,7 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
             hof_paths=hof_paths,
             include_portfolio=False,
             feedback_path=microburst_feedback_path,
+            target_paths=microburst_target_paths,
             pressure_only=True,
             min_diversity_distance=args.min_diversity_distance,
         )
@@ -1172,13 +1254,30 @@ def run_generation(state: dict[str, Any], args: argparse.Namespace, profile: Dis
     }
     final["records"] = [asdict(record) for record in records]
     submission_check = inspect_submission(args.submission_out) if Path(args.submission_out).exists() else None
-    decision = classify_final(
+    incumbent_decision = classify_final(
         final,
         submission_check,
         min_delta=args.min_holdout_score_delta if args.min_holdout_score_delta is not None else profile.min_holdout_score_delta,
         max_no_result_rate=profile.max_no_result_rate,
         near_clean_no_result_rate=args.near_clean_no_result_rate,
     )
+    final["incumbent_gate"] = incumbent_decision
+    decision = incumbent_decision
+    if args.gold_gate and final.get("status") == "promoted" and final.get("name"):
+        gold_decision = classify_gold_candidate(
+            report_d,
+            str(final["name"]),
+            incumbent_name=incumbent_name,
+            submission_sha256=str(final.get("submission_sha256") or ""),
+            max_no_result_rate=profile.max_no_result_rate,
+        )
+        final["gold_gate"] = gold_decision
+        decision = {
+            "champion_class": gold_decision["decision"],
+            "decision": gold_decision["decision"],
+            "submit_ready": gold_decision["submit_ready"],
+            "reasons": gold_decision["reasons"],
+        }
     final.update(decision)
     write_json(gen_dir / "decision.json", {"final": final, "submission_check": submission_check, "decision": decision})
     write_decision_brief(gen_dir / "decision_brief.md", final, decision, submission_check)
@@ -1319,6 +1418,7 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--min-diversity-distance", type=float, default=0.08)
     parser.add_argument("--near-clean-no-result-rate", type=float, default=0.02)
     parser.add_argument("--min-holdout-score-delta", type=float)
+    parser.add_argument("--gold-gate", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--strip-search-wrapper", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--include-portfolio", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)

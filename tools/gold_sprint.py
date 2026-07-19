@@ -23,7 +23,8 @@ from tools.auto_iterate import (
     run_generation,
     save_state,
 )
-from tools.build_submission import DEFAULT_BASE, BuildConfig, build_submission
+from tools.build_models import DEFAULT_BASE, BuildConfig
+from tools.build_submission import build_submission
 from tools.export_kaggle_submission import export_kaggle_submission
 
 

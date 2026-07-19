@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import io
+import json
+import tarfile
 from pathlib import Path
 
 from local_eval.models import AgentStats, EvalConfig, MatchReport, SubmissionInfo
@@ -11,15 +14,18 @@ from tools.discovery_engine import (
     classify_final,
     pool_paths_by_role,
     profile_from_name,
+    resolve_feedback_target_paths,
     resolve_build_workers,
     resolve_workers,
     write_pool_manifest,
 )
 from tools.discovery_feedback import aggregate_feedback
 from tools.build_submission import BuildConfig
-from tools.discovery_space import deck_distance, generate_discovery_configs, same_strategy_shape
+from tools.discovery_space import deck_distance, generate_discovery_configs, same_strategy_shape, seed_decks_from_paths
 from tools.loss_mining import digest_scenarios
 from tools.psro import solve_psro
+from tools.reference_pool import DEFAULT_REFERENCE_PATHS, load_anchor_table
+from tools.gold_gate import classify_candidate as classify_gold_candidate
 
 
 def test_smoke_discovery_profile_is_bounded():
@@ -37,6 +43,21 @@ def test_turbo_discovery_profile_uses_auto_workers_and_larger_population():
     assert turbo.workers == 0
     assert turbo.population > normal.population
     assert turbo.stage_b.candidate_limit > normal.stage_b.candidate_limit
+
+
+def test_reference_pool_includes_submission_820_and_baselines():
+    names = {path.name for path in DEFAULT_REFERENCE_PATHS}
+    assert "submission_820.tar.gz" in names
+    assert "i-have-one-rear-card.tar.gz" in names
+    assert "pokemon-ai-battle-best-ptcg-advanced.tar.gz" in names
+
+
+def test_lb_anchor_table_targets_1200():
+    table = load_anchor_table()
+    assert table["target_lb_score"] == 1200
+    anchors = {row["name"]: row for row in table["anchors"]}
+    assert anchors["i-have-one-rear-card"]["lb_score"] == 700
+    assert anchors["submission_820"]["lb_score"] == 820
 
 
 def test_resolve_workers_respects_explicit_and_auto_limits():
@@ -185,6 +206,47 @@ def test_feedback_pressure_drives_generation_configs(tmp_path: Path):
     pressure_configs = [cfg for cfg in configs if cfg.origin.startswith("pressure:") or cfg.origin.startswith("motif:pressure:")]
     assert pressure_configs
     assert any(cfg.strategy_weights.get("prize_delta") == 5200.0 for cfg in pressure_configs)
+
+
+def test_feedback_target_paths_resolve_target_candidate_and_family(tmp_path: Path):
+    explicit = tmp_path / "explicit.tar.gz"
+    same_family = tmp_path / "family.tar.gz"
+    explicit.write_text("x", encoding="utf-8")
+    same_family.write_text("x", encoding="utf-8")
+    feedback = {
+        "pressure_items": [
+            {"target_candidate": "candidate_a", "target_family": "great_tusk"},
+            {"target_candidate": "missing", "target_family": "lucario"},
+        ]
+    }
+    records = [
+        {"name": "candidate_a", "family": "great_tusk", "internal_tarball": str(explicit)},
+        {"name": "candidate_b", "family": "lucario", "internal_tarball": str(same_family)},
+    ]
+
+    paths = resolve_feedback_target_paths(feedback, records)
+
+    assert explicit.resolve() in paths
+    assert same_family.resolve() in paths
+
+
+def test_seed_decks_from_paths_preserves_tarball_family_metadata(tmp_path: Path):
+    tarball = tmp_path / "candidate.tar.gz"
+    deck = "\n".join(["1"] * 60) + "\n"
+    metadata = json.dumps({"family": "lucario"}).encode("utf-8")
+    with tarfile.open(tarball, "w:gz") as tar:
+        deck_bytes = deck.encode("utf-8")
+        deck_info = tarfile.TarInfo("deck.csv")
+        deck_info.size = len(deck_bytes)
+        tar.addfile(deck_info, io.BytesIO(deck_bytes))
+        meta_info = tarfile.TarInfo("build_metadata.json")
+        meta_info.size = len(metadata)
+        tar.addfile(meta_info, io.BytesIO(metadata))
+
+    rows = [row for row in seed_decks_from_paths([tarball]) if row[2] == tarball]
+
+    assert rows
+    assert rows[0][0] == "lucario"
 
 
 def test_deck_distance_and_strategy_shape_support_diversity_filter():
@@ -342,6 +404,65 @@ def test_classify_final_marks_near_clean_candidate_unstable():
 
     assert decision["submit_ready"] is False
     assert decision["champion_class"] == "unstable_candidate"
+
+
+def test_gold_gate_requires_strong_anchor_progress(tmp_path: Path):
+    report = {
+        "standings": [
+            {
+                "name": "candidate",
+                "games": 100,
+                "wins": 60,
+                "losses": 40,
+                "draws": 0,
+                "no_results": 0,
+                "crashes": 0,
+                "timeouts": 0,
+                "invalids": 0,
+                "kaggle_score_estimate": 600.0,
+                "opponents": {
+                    "incumbent": {"wins": 52, "losses": 48, "draws": 0},
+                    "i-have-one-rear-card": {"wins": 66, "losses": 34, "draws": 0},
+                    "submission_820": {"wins": 59, "losses": 41, "draws": 0},
+                    "pokemon-ai-battle-best-ptcg-advanced": {"wins": 50, "losses": 50, "draws": 0},
+                    "pokemon-steel": {"wins": 49, "losses": 51, "draws": 0},
+                    "pokemon-tcg-rahul-jiwane": {"wins": 48, "losses": 52, "draws": 0},
+                    "ptcg-mega-lucario-ex-v63": {"wins": 48, "losses": 52, "draws": 0},
+                    "multiply-agent-best-940-lb": {"wins": 49, "losses": 51, "draws": 0},
+                    "submission_sorce_700": {"wins": 68, "losses": 32, "draws": 0},
+                },
+            }
+        ]
+    }
+    decision = classify_gold_candidate(report, "candidate", incumbent_name="incumbent", submission_sha256="")
+    assert decision["decision"] == "kaggle_probe_ready"
+    assert decision["submit_ready"] is False
+    assert decision["gold_gate_passed"] is True
+
+
+def test_gold_gate_fails_without_required_anchor_matchups():
+    report = {
+        "standings": [
+            {
+                "name": "candidate",
+                "games": 10,
+                "wins": 10,
+                "losses": 0,
+                "draws": 0,
+                "no_results": 0,
+                "crashes": 0,
+                "timeouts": 0,
+                "invalids": 0,
+                "kaggle_score_estimate": 600.0,
+                "opponents": {"incumbent": {"wins": 10, "losses": 0, "draws": 0}},
+            }
+        ]
+    }
+
+    decision = classify_gold_candidate(report, "candidate", incumbent_name="incumbent")
+
+    assert decision["decision"] == "gold_gate_failed"
+    assert "missing required anchor matchup: i-have-one-rear-card" in decision["reasons"]
 
 
 def test_psro_gives_weight_to_cycle_strategy():

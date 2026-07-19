@@ -10,7 +10,8 @@ from typing import Any
 from local_eval.archive import sha256_file
 from local_eval.evaluator import run_ladder, save_report
 from local_eval.models import AgentStats, EvalConfig, MatchReport
-from tools.build_submission import BuildConfig, build_submission
+from tools.build_models import BuildConfig
+from tools.build_submission import build_submission
 from tools.export_kaggle_submission import export_kaggle_submission
 from tools.prior_deck_space import (
     REFERENCE_BASES,
@@ -18,19 +19,13 @@ from tools.prior_deck_space import (
     metal_prior_configs,
     portfolio_seed_configs,
 )
+from tools.reference_pool import DEFAULT_REFERENCE_PATHS
 
 
 DEFAULT_OUT = Path("outputs/gold_factory")
 DEFAULT_PROMOTE = Path("outputs/submissions/gold_factory_champion.tar.gz")
 DEFAULT_SUBMISSION = Path("outputs/submissions/submission.tar.gz")
-DEFAULT_POOL = [
-    Path("outputs/reference_submissions/i-have-one-rear-card.tar.gz"),
-    Path("outputs/reference_submissions/pokemon-steel.tar.gz"),
-    Path("outputs/reference_submissions/pokemon-tcg-rahul-jiwane.tar.gz"),
-    Path("outputs/reference_submissions/improved-probabilistic-agent.tar.gz"),
-    Path("outputs/reference_submissions/ptcg-mega-lucario-ex-v63.tar.gz"),
-    Path("基准/submission_sorce_700.tar.gz"),
-]
+DEFAULT_POOL = DEFAULT_REFERENCE_PATHS
 
 
 @dataclass(slots=True)

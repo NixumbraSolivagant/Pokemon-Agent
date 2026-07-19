@@ -10,7 +10,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from tools.build_submission import ACE_SPEC_IDS, BASIC_ENERGY_IDS, BuildConfig, DEFAULT_BASE, validate_deck_ids
+from tools.build_models import DEFAULT_BASE, BuildConfig
+from tools.deck_rules import ACE_SPEC_IDS, BASIC_ENERGY_IDS, validate_deck_ids
 from tools.prior_deck_space import (
     GT_PRIOR_PACKAGES,
     REFERENCE_BASES,
@@ -64,6 +65,20 @@ def read_build_metadata(path: Path) -> dict[str, Any]:
             return json.loads(payload.read().decode("utf-8"))
     except Exception:
         return {}
+
+
+def family_hint_from_path(path: Path) -> str:
+    metadata = read_build_metadata(path)
+    family = str(metadata.get("family") or "").strip()
+    if family:
+        return family
+    lower = path.name.lower()
+    for name in ("great_tusk", "lucario", "metal_tempo", "rahul_metal", "probabilistic"):
+        if name in lower:
+            return name
+    if "steel" in lower or "metal" in lower:
+        return "metal_tempo"
+    return "great_tusk"
 
 
 def deck_hash(deck: list[int]) -> str:
@@ -791,7 +806,7 @@ def seed_decks_from_paths(paths: list[Path]) -> list[tuple[str, str, Path, list[
             continue
         label = path.name.removesuffix(".tar.gz").replace(".", "_")
         try:
-            out.append(("great_tusk", label, path, read_deck_from_tarball(path)))
+            out.append((family_hint_from_path(path), label, path, read_deck_from_tarball(path)))
         except Exception:
             continue
     seen: set[str] = set()
@@ -815,16 +830,18 @@ def generate_discovery_configs(
     include_portfolio: bool = True,
     loss_digest_path: Path | None = None,
     feedback_path: Path | None = None,
+    target_paths: list[Path] | None = None,
     pressure_only: bool = False,
     min_diversity_distance: float = 0.0,
 ) -> list[BuildConfig]:
     rng = random.Random(seed + generation * 1009)
     out_dir.mkdir(parents=True, exist_ok=True)
     hof_paths = [path for path in (hof_paths or []) if path.exists()]
+    target_paths = [path for path in (target_paths or []) if path.exists()]
     incumbent = incumbent_from_tarball(incumbent_tarball, out_dir)
     incumbent = replace(incumbent, name=f"d{generation:03d}_incumbent", out=out_dir / f"d{generation:03d}_incumbent.tar.gz")
 
-    seed_decks = seed_decks_from_paths([incumbent_tarball, *hof_paths])
+    seed_decks = seed_decks_from_paths([incumbent_tarball, *hof_paths, *target_paths])
     configs: list[BuildConfig] = [incumbent]
     pressure_motifs = motifs_from_feedback(feedback_path)
     has_feedback = bool(pressure_motifs or read_feedback(feedback_path).get("pressure_items"))
@@ -840,7 +857,7 @@ def generate_discovery_configs(
         configs.extend(search_strategy_matrix_configs(incumbent, generation, out_dir, max(12, population // 2)))
         configs.extend(opponent_search_matrix_configs(incumbent, generation, out_dir, max(8, population // 4)))
     if not pressure_only:
-        motifs = [*motifs_from_loss_digest(loss_digest_path), *manual_motifs(), *motifs_from_decks([incumbent_tarball, *hof_paths])]
+        motifs = [*motifs_from_loss_digest(loss_digest_path), *manual_motifs(), *motifs_from_decks([incumbent_tarball, *hof_paths, *target_paths])]
         motif_limit = max(8, population // 3)
         configs.extend(reference_seed_configs(out_dir, generation))
         configs.extend(motif_configs(incumbent, generation, out_dir, motifs, seed_decks, motif_limit, rng))

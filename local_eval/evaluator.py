@@ -217,10 +217,14 @@ def _metadata(project_root: str | Path) -> dict[str, object]:
         "platform": platform.platform(),
         "project_root": str(Path(project_root).resolve()),
         "score_formula": "mu - 3*sigma",
+        "score_field_alias": {
+            "kaggle_score_estimate": "local_trueskill_score",
+        },
         "scoring_note": (
             "This evaluator runs official cg battles locally and applies a "
-            "TrueSkill-style Kaggle score estimate. Kaggle private backend "
-            "matchmaking and rating parameters are not guaranteed to match."
+            "TrueSkill-style local score. It is not the Kaggle leaderboard "
+            "score; Kaggle private backend matchmaking and rating parameters "
+            "are not guaranteed to match."
         ),
     }
 

@@ -3,16 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from pathlib import Path
 
-from tools.build_submission import BuildConfig, DEFAULT_BASE
-
-
-REFERENCE_BASES = {
-    "great_tusk": Path("outputs/reference_submissions/i-have-one-rear-card.tar.gz"),
-    "metal_tempo": Path("outputs/reference_submissions/pokemon-steel.tar.gz"),
-    "rahul_metal": Path("outputs/reference_submissions/pokemon-tcg-rahul-jiwane.tar.gz"),
-    "lucario": Path("outputs/reference_submissions/ptcg-mega-lucario-ex-v63.tar.gz"),
-    "probabilistic": Path("outputs/reference_submissions/improved-probabilistic-agent.tar.gz"),
-}
+from tools.build_models import DEFAULT_BASE, BuildConfig
+from tools.reference_pool import REFERENCE_BASES
 
 
 # Card IDs already observed in the strongest Great Tusk reference or in nearby public

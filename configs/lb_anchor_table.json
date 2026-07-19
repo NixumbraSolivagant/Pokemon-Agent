@@ -1,0 +1,77 @@
+{
+  "target_lb_score": 1200,
+  "anchors": [
+    {
+      "name": "i-have-one-rear-card",
+      "path": "outputs/reference_submissions/i-have-one-rear-card.tar.gz",
+      "role": "baseline_700",
+      "lb_score": 700,
+      "score_source": "user_reported",
+      "score_date": "2026-07-19",
+      "sha256": ""
+    },
+    {
+      "name": "submission_820",
+      "path": "outputs/reference_submissions/submission_820.tar.gz",
+      "role": "baseline_820",
+      "lb_score": 820,
+      "score_source": "filename_or_user_reported",
+      "score_date": "2026-07-19",
+      "sha256": ""
+    },
+    {
+      "name": "pokemon-ai-battle-best-ptcg-advanced",
+      "path": "outputs/reference_submissions/pokemon-ai-battle-best-ptcg-advanced.tar.gz",
+      "role": "advanced_anchor",
+      "lb_score": null,
+      "score_source": "",
+      "score_date": "",
+      "sha256": ""
+    },
+    {
+      "name": "pokemon-steel",
+      "path": "outputs/reference_submissions/pokemon-steel.tar.gz",
+      "role": "metal_anchor",
+      "lb_score": null,
+      "score_source": "",
+      "score_date": "",
+      "sha256": ""
+    },
+    {
+      "name": "pokemon-tcg-rahul-jiwane",
+      "path": "outputs/reference_submissions/pokemon-tcg-rahul-jiwane.tar.gz",
+      "role": "metal_anchor",
+      "lb_score": null,
+      "score_source": "",
+      "score_date": "",
+      "sha256": ""
+    },
+    {
+      "name": "ptcg-mega-lucario-ex-v63",
+      "path": "outputs/reference_submissions/ptcg-mega-lucario-ex-v63.tar.gz",
+      "role": "lucario_anchor",
+      "lb_score": null,
+      "score_source": "",
+      "score_date": "",
+      "sha256": ""
+    },
+    {
+      "name": "multiply-agent-best-940-lb",
+      "path": "outputs/reference_submissions/multiply-agent-best-940-lb.tar.gz",
+      "role": "public_940_anchor",
+      "lb_score": 940,
+      "score_source": "filename",
+      "score_date": "2026-07-19",
+      "sha256": ""
+    },
+    {
+      "name": "submission_sorce_700",
+      "path": "基准/submission_sorce_700.tar.gz",
+      "role": "baseline_700",
+      "lb_score": 700,
+      "score_source": "filename",
+      "score_date": "2026-07-19",
+      "sha256": ""
+    }
+  ]
+}

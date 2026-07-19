@@ -5,71 +5,12 @@ import copy
 import io
 import json
 import tarfile
-from collections import Counter
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from tools.build_models import DEFAULT_BASE, DEFAULT_OUT, BuildConfig
+from tools.deck_rules import ACE_SPEC_IDS, BASIC_ENERGY_IDS, apply_deck_swaps, deck_to_text, validate_deck_ids
 from tools.export_kaggle_submission import export_kaggle_submission
-
-
-DEFAULT_BASE = Path("outputs/reference_submissions/i-have-one-rear-card.tar.gz")
-DEFAULT_OUT = Path("outputs/submissions/champion_gt_search.tar.gz")
-BASIC_ENERGY_IDS = {1, 2, 3, 4, 5, 6, 7, 8}
-ACE_SPEC_IDS = {
-    10,
-    12,
-    13,
-    1080,
-    1082,
-    1085,
-    1088,
-    1089,
-    1092,
-    1093,
-    1095,
-    1096,
-    1100,
-    1104,
-    1107,
-    1109,
-    1110,
-    1111,
-    1125,
-    1126,
-    1128,
-    1155,
-    1158,
-    1159,
-    1165,
-    1167,
-    1169,
-    1247,
-    1249,
-}
-
-
-@dataclass(slots=True)
-class BuildConfig:
-    name: str = "champion_gt_search"
-    family: str = "great_tusk"
-    base: Path = DEFAULT_BASE
-    out: Path = DEFAULT_OUT
-    enable_search: bool = True
-    injection: str = "great_tusk"
-    search_candidates: int = 8
-    search_budget_s: float = 0.25
-    search_margin: float = 1200.0
-    search_rollout_steps: int = 16
-    deck_swaps: list[tuple[int, int]] = field(default_factory=list)
-    deck_override: list[int] | None = None
-    deck_files: tuple[str, ...] = ("deck.csv",)
-    strategy_weights: dict[str, float] = field(default_factory=dict)
-    policy_variant: str = "default"
-    opponent_model: str = "perfect"
-    origin: str = ""
-    notes: str = ""
-    include_build_metadata: bool = True
 
 
 SEARCH_INJECTION = r'''
@@ -592,43 +533,6 @@ def build_main(original: str, cfg: BuildConfig) -> str:
         .replace("__GT_OPPONENT_MODEL__", cfg.opponent_model.replace("\\", "\\\\").replace('"', '\\"'))
     )
     return original.rstrip() + "\n" + injection.lstrip()
-
-
-def validate_deck_ids(deck: list[int]) -> None:
-    counts = Counter(deck)
-    if len(deck) != 60:
-        raise ValueError(f"Deck must contain 60 cards, got {len(deck)}")
-    if any(card_id <= 0 for card_id in deck):
-        raise ValueError("Deck card ids must be positive ints")
-    over_limit = [card_id for card_id, count in counts.items() if card_id not in BASIC_ENERGY_IDS and count > 4]
-    if over_limit:
-        raise ValueError(f"Non-basic cards exceed four-copy limit: {sorted(over_limit)}")
-    ace_specs = [card_id for card_id in deck if card_id in ACE_SPEC_IDS]
-    if len(ace_specs) > 1:
-        raise ValueError(f"Deck cannot contain more than one ACE SPEC card: {sorted(ace_specs)}")
-
-
-def deck_to_text(deck: list[int]) -> str:
-    validate_deck_ids(deck)
-    return "\n".join(str(card_id) for card_id in deck) + "\n"
-
-
-def apply_deck_swaps(deck_text: str, swaps: list[tuple[int, int]], override: list[int] | None = None) -> str:
-    if override is not None:
-        return deck_to_text(list(override))
-    deck = [int(line) for line in deck_text.splitlines() if line.strip()]
-    counts = Counter(deck)
-    for add_id, remove_id in swaps:
-        if counts[remove_id] <= 0:
-            continue
-        if add_id not in BASIC_ENERGY_IDS and counts[add_id] >= 4:
-            continue
-        counts[remove_id] -= 1
-        counts[add_id] += 1
-    out: list[int] = []
-    for card_id, count in counts.items():
-        out.extend([card_id] * count)
-    return deck_to_text(out)
 
 
 def build_submission(cfg: BuildConfig) -> Path:

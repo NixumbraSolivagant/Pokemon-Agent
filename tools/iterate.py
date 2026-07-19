@@ -8,18 +8,13 @@ from pathlib import Path
 
 from local_eval.evaluator import run_ladder, save_report
 from local_eval.models import EvalConfig
-from tools.build_submission import BuildConfig, DEFAULT_BASE, build_submission
+from tools.build_models import DEFAULT_BASE, BuildConfig
+from tools.build_submission import build_submission
 from tools.export_kaggle_submission import export_kaggle_submission
+from tools.reference_pool import DEFAULT_REFERENCE_PATHS
 
 
-DEFAULT_POOL = [
-    "outputs/reference_submissions/i-have-one-rear-card.tar.gz",
-    "outputs/reference_submissions/pokemon-steel.tar.gz",
-    "outputs/reference_submissions/pokemon-tcg-rahul-jiwane.tar.gz",
-    "outputs/reference_submissions/improved-probabilistic-agent.tar.gz",
-    "outputs/reference_submissions/ptcg-mega-lucario-ex-v63.tar.gz",
-    "基准/submission_sorce_700.tar.gz",
-]
+DEFAULT_POOL = [str(path) for path in DEFAULT_REFERENCE_PATHS]
 
 
 def preset_variants(base: Path, out_dir: Path) -> list[BuildConfig]:
