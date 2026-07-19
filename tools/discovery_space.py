@@ -12,6 +12,7 @@ from typing import Any
 
 from tools.build_models import DEFAULT_BASE, BuildConfig
 from tools.deck_rules import ACE_SPEC_IDS, BASIC_ENERGY_IDS, validate_deck_ids
+from tools.policy_genome import generate_synthetic_configs
 from tools.prior_deck_space import (
     GT_PRIOR_PACKAGES,
     REFERENCE_BASES,
@@ -777,6 +778,8 @@ def incumbent_from_tarball(path: Path, out_dir: Path) -> BuildConfig:
         search_budget_s=float(metadata.get("search_budget_s", 0.25)),
         search_margin=float(metadata.get("search_margin", 1200.0)),
         search_rollout_steps=int(metadata.get("search_rollout_steps", 16)),
+        belief_worlds=int(metadata.get("belief_worlds", 4)),
+        risk_penalty=float(metadata.get("risk_penalty", 0.20)),
         deck_swaps=[tuple(map(int, pair)) for pair in metadata.get("deck_swaps", [])],
         deck_override=metadata.get("deck_override"),
         deck_files=tuple(metadata.get("deck_files", ("deck.csv",))),
@@ -856,21 +859,29 @@ def generate_discovery_configs(
         configs.extend(tag_combo_configs(incumbent, generation, out_dir, max(8, population // 3), rng))
         configs.extend(search_strategy_matrix_configs(incumbent, generation, out_dir, max(12, population // 2)))
         configs.extend(opponent_search_matrix_configs(incumbent, generation, out_dir, max(8, population // 4)))
+    if not pressure_only and loss_digest_path is not None:
+        digest_motifs = motifs_from_loss_digest(loss_digest_path)
+        configs.extend(motif_configs(incumbent, generation, out_dir, digest_motifs, seed_decks, max(2, population // 10), rng))
+
+    legacy_budget = min(max(4, population // 8), max(0, population - len(configs)))
+    legacy_configs: list[BuildConfig] = []
     if not pressure_only:
-        motifs = [*motifs_from_loss_digest(loss_digest_path), *manual_motifs(), *motifs_from_decks([incumbent_tarball, *hof_paths, *target_paths])]
-        motif_limit = max(8, population // 3)
-        configs.extend(reference_seed_configs(out_dir, generation))
-        configs.extend(motif_configs(incumbent, generation, out_dir, motifs, seed_decks, motif_limit, rng))
-        configs.extend(motif_combo_configs(incumbent, generation, out_dir, motifs, seed_decks, max(8, population // 4), rng))
-        configs.extend(tag_sweep_configs(incumbent, generation, out_dir, max(4, population // 8), rng))
-        configs.extend(tag_combo_configs(incumbent, generation, out_dir, max(8, population // 3), rng))
-        configs.extend(strategy_variants(incumbent, generation, out_dir))
-        configs.extend(search_strategy_matrix_configs(incumbent, generation, out_dir, max(12, population // 4)))
-        configs.extend(opponent_search_matrix_configs(incumbent, generation, out_dir, max(8, population // 8)))
-        configs.extend(great_tusk_prior_configs(incumbent, generation, out_dir, max(12, population // 4)))
+        legacy_configs.extend(search_strategy_matrix_configs(incumbent, generation, out_dir, max(12, legacy_budget)))
+        legacy_configs.extend(opponent_search_matrix_configs(incumbent, generation, out_dir, max(8, legacy_budget // 2)))
         if include_portfolio:
-            configs.extend(metal_prior_configs(generation, out_dir, max(8, population // 8)))
-            configs.extend(portfolio_seed_configs(generation, out_dir))
+            legacy_configs.extend(metal_prior_configs(generation, out_dir, max(4, legacy_budget // 2)))
+
+    synthetic_population = max(0, population - len(configs) - legacy_budget)
+    configs.extend(
+        generate_synthetic_configs(
+            incumbent,
+            out_dir,
+            synthetic_population,
+            seed + generation * 7919,
+            feedback_path,
+        )
+    )
+    configs.extend(legacy_configs[:legacy_budget])
 
     unique: list[BuildConfig] = []
     seen_name: set[str] = set()
@@ -886,7 +897,14 @@ def generate_discovery_configs(
                 "swaps": cfg.deck_swaps,
                 "override_hash": deck_hash(cfg.deck_override) if cfg.deck_override else "",
                 "strategy": cfg.strategy_weights,
-                "search": [cfg.search_candidates, cfg.search_budget_s, cfg.search_margin, cfg.search_rollout_steps],
+                "search": [
+                    cfg.search_candidates,
+                    cfg.search_budget_s,
+                    cfg.search_margin,
+                    cfg.search_rollout_steps,
+                    cfg.belief_worlds,
+                    cfg.risk_penalty,
+                ],
                 "injection": cfg.injection,
                 "policy_variant": cfg.policy_variant,
                 "opponent_model": cfg.opponent_model,

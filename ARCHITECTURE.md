@@ -46,6 +46,14 @@ backward compatibility. New code should import them from their owning modules.
 - Treat the injected search wrapper as generated code. Changes to its behavior
   belong in `tools/build_submission.py` and require archive-level tests.
 
+## Strategy Discovery
+
+Candidate generation is intentionally reference-light. `tools/policy_genome.py`
+creates legal role-based decks and route parameters, while
+`tools/counterexample_search.py` converts loss feedback into targeted bias. The
+reference pool remains an evaluation and packaging anchor; it is not the main
+parent population for normal discovery generations.
+
 ## Validation
 
 Run the focused validation sequence after structural changes:

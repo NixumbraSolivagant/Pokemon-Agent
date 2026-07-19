@@ -1453,16 +1453,29 @@ def _gt_option_tactical_bonus(obs, option, score):
     active = active_pokemon(me)
     bonus = 0
     try:
+        route = GT_POLICY_VARIANT.replace("synthetic_", "") if "GT_POLICY_VARIANT" in globals() else "adaptive"
+        route = {
+            "fast_ko": "ko_first",
+            "slow_ko": "ko_first",
+            "bench_pressure": "ko_first",
+            "wall": "wall_first",
+            "mill": "mill_first",
+            "denial": "resource_denial",
+        }.get(route, route)
         if select.context == SelectContext.MAIN:
             if option.type == OptionType.PLAY:
                 card = get_card(obs, AreaType.HAND, option.index, state.yourIndex)
                 cid = getattr(card, "id", None)
                 if cid == EXPLORER_GUIDANCE and active is not None and active.id == GREAT_TUSK and can_pay_attack(active, LAND_COLLAPSE):
                     bonus += 900000
+                    if route == "mill_first":
+                        bonus += 240000
                 elif cid in (POKEGEAR_30, POKE_PAD, ULTRA_BALL, FIGHT_GONG, BUDDY_BUDDY_POFFIN):
                     bonus += 220000
                 elif cid in (ERI, XEROSIC_SCHEME, HAND_TRIMMER, ENHANCED_HAMMER, ENERGY_LASSO, FLUTE):
                     bonus += 160000
+                    if route == "resource_denial":
+                        bonus += 260000
                 elif cid in (NIGHT_STRETCHER, SACRED_ASH, ENERGY_RECYCLER, JUMBO_ICE_CREAM):
                     bonus += 90000
                 elif cid in (HERO_CAPE, AIR_BALLOON, SACRED_CHARM, HANDY_CIRCULATOR, GRAVITY_GEM):
@@ -1473,14 +1486,22 @@ def _gt_option_tactical_bonus(obs, option, score):
                 bonus += 180000
             elif option.type == OptionType.EVOLVE:
                 bonus += 160000
+                if route == "wall_first":
+                    bonus += 200000
             elif option.type == OptionType.ABILITY:
                 bonus += 150000
             elif option.type == OptionType.RETREAT:
                 bonus += 100000
+                if route == "wall_first":
+                    bonus += 150000
             elif option.type == OptionType.ATTACK:
                 bonus += 260000
+                if route == "ko_first":
+                    bonus += 220000
                 if active is not None and active.id == GREAT_TUSK and can_pay_attack(active, LAND_COLLAPSE):
                     bonus += 220000
+                    if route == "mill_first":
+                        bonus += 300000
                     if state.supporterPlayed:
                         bonus += 320000
             elif option.type == OptionType.END:

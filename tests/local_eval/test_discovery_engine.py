@@ -77,7 +77,7 @@ def test_resolve_build_workers_defaults_to_bounded_effective_workers():
     assert resolve_build_workers(Namespace(build_workers=None, workers=0, cpu_headroom=0, max_workers=99), profile) <= 32
 
 
-def test_discovery_generation_includes_motif_or_tag_deck_overrides(tmp_path: Path):
+def test_discovery_generation_includes_reference_free_policy_genomes(tmp_path: Path):
     configs = generate_discovery_configs(
         Path("outputs/submissions/champion_latest.tar.gz"),
         tmp_path,
@@ -87,7 +87,8 @@ def test_discovery_generation_includes_motif_or_tag_deck_overrides(tmp_path: Pat
     )
     assert len(configs) == 14
     assert any(cfg.deck_override for cfg in configs)
-    assert any(cfg.origin.startswith("motif") or cfg.origin == "tag_sweep" for cfg in configs)
+    assert any(cfg.origin == "synthetic_policy_genome" for cfg in configs)
+    assert any(cfg.policy_variant.startswith("synthetic_") for cfg in configs)
 
 
 def test_loss_digest_can_drive_generation_motifs(tmp_path: Path):

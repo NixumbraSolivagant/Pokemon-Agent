@@ -14,10 +14,10 @@ case "$cmd" in
     log="outputs/remote_logs/gold_discovery_${stamp}.log"
     nohup .venv/bin/python -m tools.discovery_engine run \
       --profile "${PROFILE:-a800_turbo_discovery}" \
-      --out "${OUT:-outputs/gold_discovery}" \
-      --incumbent "${INCUMBENT:-outputs/submissions/champion_latest.tar.gz}" \
-      --promote "${PROMOTE:-outputs/submissions/gold_probe_candidate.tar.gz}" \
-      --submission-out "${SUBMISSION_OUT:-outputs/submissions/submission_gold_probe.tar.gz}" \
+      --out "${OUT:-outputs/discovery_synthetic_gold}" \
+      --incumbent "${INCUMBENT:-outputs/submissions/champion_belief_d34d4f3.tar.gz}" \
+      --promote "${PROMOTE:-outputs/submissions/champion_synthetic_gold.tar.gz}" \
+      --submission-out "${SUBMISSION_OUT:-outputs/submissions/submission_synthetic_gold.tar.gz}" \
       --workers "${WORKERS:-30}" \
       --build-workers "${BUILD_WORKERS:-30}" \
       --cpu-headroom "${CPU_HEADROOM:-0}" \
