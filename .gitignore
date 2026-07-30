@@ -1,13 +1,24 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.playwright-cli/
+.tools/
 
 outputs/
+output/
 reports/
 log/
 pokemon-tcg-ai-battle/
 
 *.log
 *.tmp
+kag.zip
+服务器.txt
+
+# Replay-derived competitive assets stay local. The public code accepts
+# generated models, but raw opponent lists and restored leaderboard decks are
+# intentionally not versioned.
+configs/kaggle_replay_opponent_models.json
+configs/replay_restored_826_deck.csv
 
 参考/

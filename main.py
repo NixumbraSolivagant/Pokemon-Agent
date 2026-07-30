@@ -47,6 +47,7 @@ JUDGE = 1213
 BOSS_ORDERS = 1182
 LISIA_APPEAL = 1204
 NEUTRAL_CENTER = 1247
+BATTLE_CAGE = 1264
 
 # Energies
 BASIC_GRASS_ENERGY = 1
@@ -87,7 +88,8 @@ RECOVERY_ITEMS = {NIGHT_STRETCHER, SACRED_ASH, ENERGY_RECYCLER}
 SUPPORTERS = {EXPLORER_GUIDANCE, ERI, XEROSIC_SCHEME, COLRESS_TENACITY, JUDGE, BOSS_ORDERS, LISIA_APPEAL}
 AIR_BALLOON = 1174
 SACRED_CHARM = 1177
-TOOLS = {HANDY_CIRCULATOR, GRAVITY_GEM, HERO_CAPE, AIR_BALLOON, SACRED_CHARM}
+HABAN_BERRY = 1170
+TOOLS = {HANDY_CIRCULATOR, GRAVITY_GEM, HERO_CAPE, AIR_BALLOON, SACRED_CHARM, HABAN_BERRY}
 
 CARD_TABLE = {card.cardId: card for card in all_card_data()}
 ATTACK_TABLE = {attack.attackId: attack for attack in all_attack()}
@@ -109,11 +111,16 @@ EX_EVOLUTION_ANCESTORS = _ex_evolution_ancestor_names()
 
 
 def read_deck_csv() -> list[int]:
-    candidates = [
-        Path(__file__).resolve().parent / "deck.csv",
-        Path("deck.csv"),
-        Path("/kaggle_simulations/agent/deck.csv"),
-    ]
+    candidates = []
+    module_file = globals().get("__file__")
+    if module_file:
+        candidates.append(Path(module_file).resolve().parent / "deck.csv")
+    candidates.extend(
+        [
+            Path("/kaggle_simulations/agent/deck.csv"),
+            Path("deck.csv"),
+        ]
+    )
     path = next((candidate for candidate in candidates if candidate.exists()), candidates[0])
     with path.open("r", encoding="utf-8") as file:
         return [int(line) for line in file.read().splitlines()[:60]]
@@ -373,7 +380,8 @@ def desired_field_floor(me, opponent, state) -> int:
     if facing_lucario_strong(opponent):
         return 5
     if opponent_bench_counter_pressure(opponent):
-        return 3
+        stadium_id = state.stadium[0].id if state.stadium else None
+        return 3 if stadium_id == BATTLE_CAGE else 2
     if opponent_can_attack_soon(opponent):
         return 3
     return 2
@@ -703,6 +711,14 @@ def play_score(card_id: int, me, opponent, state, wall_mode: bool, ko_mode: bool
         if not state.stadiumPlayed and current_stadium != NEUTRAL_CENTER:
             # Stadium must be established before ATTACK ends the turn.
             score = 330000
+    elif card_id == BATTLE_CAGE:
+        current_stadium = state.stadium[0].id if state.stadium else None
+        if (
+            not state.stadiumPlayed
+            and facing_dragapult_sample(opponent)
+            and current_stadium not in (BATTLE_CAGE, NEUTRAL_CENTER)
+        ):
+            score = 310000
     elif card_id == FLUTE:
         if opponent.benchMax - len(opponent.bench) > 0 and opponent.deckCount >= 5:
             score = 21000
@@ -862,6 +878,13 @@ def attach_score(card_id: int, target: Pokemon | None, in_play_area, me, opponen
                 return 110000
             return 25000
         return -10000
+    if card_id == HABAN_BERRY:
+        if facing_dragapult_sample(opponent) and not has_tool(target, HABAN_BERRY):
+            if target.id == CRUSTLE:
+                return 310000 if in_play_area == AreaType.ACTIVE else 245000
+            if target.id == GREAT_TUSK:
+                return 235000 if in_play_area == AreaType.ACTIVE else 175000
+        return -10000
     if card_id == GRAVITY_GEM:
         if in_play_area == AreaType.ACTIVE and not has_tool(target, GRAVITY_GEM):
             if target.id == CRUSTLE and wall_mode:
@@ -915,6 +938,8 @@ def switch_score(card: Pokemon, player_index: int, me, opponent, state, wall_mod
         return 190000 + attached_energy_count(card) * 500 - damage_on(card)
     if wall_mode and card.id == CRUSTLE:
         return 150000 + attached_energy_count(card) * 600 - damage_on(card)
+    if facing_dragapult_sample(opponent) and card.id == CRUSTLE and has_tool(card, HABAN_BERRY):
+        return 205000 + attached_energy_count(card) * 600 - damage_on(card)
     if card.id == GREAT_TUSK and can_pay_attack(card, LAND_COLLAPSE):
         return 120000 + attached_energy_count(card) * 500 - damage_on(card)
     if card.id == DWEBBLE and wall_mode:
@@ -1030,6 +1055,9 @@ def select_card_score(card, player_index, context, me, opponent, state, wall_mod
         # Search target priorities. Ultra Ball can search both Great Tusk and Crustle.
         if cid == NEUTRAL_CENTER:
             return 120000
+        if cid == BATTLE_CAGE and facing_dragapult_sample(opponent):
+            current_stadium = state.stadium[0].id if state.stadium else None
+            return 115000 if current_stadium not in (BATTLE_CAGE, NEUTRAL_CENTER) else 5000
         if cid == COLRESS_TENACITY and (opponent_ex_pressure(opponent) or opponent_shows_ex_evolution_line(opponent)):
             return 110000
         if cid == EXPLORER_GUIDANCE and active_tusk_ready(me) and not state.supporterPlayed:
@@ -1478,8 +1506,10 @@ def _gt_option_tactical_bonus(obs, option, score):
                         bonus += 260000
                 elif cid in (NIGHT_STRETCHER, SACRED_ASH, ENERGY_RECYCLER, JUMBO_ICE_CREAM):
                     bonus += 90000
-                elif cid in (HERO_CAPE, AIR_BALLOON, SACRED_CHARM, HANDY_CIRCULATOR, GRAVITY_GEM):
+                elif cid in (HERO_CAPE, AIR_BALLOON, SACRED_CHARM, HABAN_BERRY, HANDY_CIRCULATOR, GRAVITY_GEM):
                     bonus += 85000
+                elif cid == BATTLE_CAGE and facing_dragapult_sample(opponent):
+                    bonus += 300000
                 elif cid in (BOSS_ORDERS, LISIA_APPEAL):
                     bonus += 75000 if opponent.deckCount <= 16 else 25000
             elif option.type == OptionType.ATTACH:

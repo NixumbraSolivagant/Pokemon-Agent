@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import main
 
 
@@ -21,3 +23,14 @@ def test_fallback_action_respects_selection_bounds():
     }
 
     assert main._fallback_action(observation) == [0]
+
+
+def test_kaggle_exec_without_file_reads_deck(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "deck.csv").write_text(Path(main.__file__).with_name("deck.csv").read_text(), encoding="utf-8")
+    namespace = {"__name__": "kaggle_submission"}
+
+    exec(compile(Path(main.__file__).read_text(encoding="utf-8"), "main.py", "exec"), namespace)
+
+    assert "__file__" not in namespace
+    assert len(namespace["agent"]({"select": None, "current": None, "logs": []})) == 60
