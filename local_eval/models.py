@@ -6,10 +6,13 @@ from typing import Any, Literal
 
 
 Outcome = Literal["P0_WIN", "P1_WIN", "DRAW", "P0_LOSS", "P1_LOSS", "NO_RESULT"]
+EvalProfile = Literal["legacy", "kaggle"]
+AgentStatus = Literal["ACTIVE", "INACTIVE", "DONE", "ERROR", "INVALID", "TIMEOUT"]
 
 
 @dataclass(slots=True)
 class EvalConfig:
+    profile: EvalProfile = "legacy"
     act_timeout_s: float = 6.0
     import_timeout_s: float = 6.0
     deck_timeout_s: float = 6.0
@@ -34,6 +37,21 @@ class EvalConfig:
     progress_file: str = ""
     archive_cache_dir: str = ""
     max_in_flight: int = 0
+    common_random_seeds: bool = False
+
+    def __post_init__(self) -> None:
+        if self.profile not in ("legacy", "kaggle"):
+            raise ValueError(f"Unknown evaluator profile: {self.profile!r}")
+        if self.profile == "kaggle":
+            if self.common_random_seeds:
+                raise ValueError(
+                    "Kaggle profile cannot use common_random_seeds: the official cg engine "
+                    "seeds battles from std::random_device and exposes no seeded battle start."
+                )
+            self.act_timeout_s = 0.0
+            self.overage_time_s = 600.0
+            self.run_timeout_s = 2000.0
+            self.max_actions = 10_000_000
 
 
 @dataclass(slots=True)
@@ -60,6 +78,12 @@ class GameResult:
     p1_seat: int = 1
     error: str = ""
     trace: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    p0_status: AgentStatus = "DONE"
+    p1_status: AgentStatus = "DONE"
+    p0_reward: float | None = None
+    p1_reward: float | None = None
+    failure_class: str = ""
+    ranking_eligible: bool = True
 
     def to_dict(self, include_trace: bool = False) -> dict[str, Any]:
         data = asdict(self)
@@ -84,6 +108,11 @@ class AgentStats:
     mu: float = 600.0
     sigma: float = 200.0
     kaggle_score_estimate: float = 0.0
+    local_trueskill_score: float = 0.0
+    kaggle_rank_score: float | None = None
+    predicted_public_score: float | None = None
+    prediction_interval: list[float] | None = None
+    calibration_version: str = ""
     opponents: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

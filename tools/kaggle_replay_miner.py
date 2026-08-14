@@ -29,6 +29,8 @@ ARCHETYPES: tuple[tuple[str, frozenset[int]], ...] = (
 )
 
 ENERGY_IDS = frozenset(range(1, 21))
+GREAT_TUSK = 58
+LAND_COLLAPSE = 62
 
 
 def load_json(path: Path) -> Any:
@@ -112,6 +114,76 @@ def unique_events(replay: dict[str, Any]) -> list[dict[str, Any]]:
     return events
 
 
+def timeline_events(replay: dict[str, Any]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    events: list[dict[str, Any]] = []
+    for step_index, step in enumerate(replay.get("steps", [])):
+        for agent in step:
+            observation = agent.get("observation") or {}
+            current = observation.get("current") or {}
+            for event in observation.get("logs") or []:
+                key = json.dumps(event, sort_keys=True, separators=(",", ":"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                events.append({**event, "step": step_index, "turn": current.get("turn")})
+    return events
+
+
+def attack_metrics(events: list[dict[str, Any]], player: int) -> dict[str, int | None]:
+    attacks = [event for event in events if event.get("type") == 15 and int(event.get("playerIndex", -1)) == player]
+    collapses = [event for event in attacks if int(event.get("attackId", -1)) == LAND_COLLAPSE]
+    return {
+        "attack_count": len(attacks),
+        "land_collapse_count": len(collapses),
+        "first_land_collapse_turn": collapses[0].get("turn") if collapses else None,
+        "first_land_collapse_step": collapses[0].get("step") if collapses else None,
+    }
+
+
+def first_ready_tusk_turn(replay: dict[str, Any], player_index: int) -> int | None:
+    for step in replay.get("steps", []):
+        observation = step[player_index].get("observation") or {}
+        current = observation.get("current") or {}
+        players = current.get("players") or []
+        if player_index >= len(players):
+            continue
+        player = players[player_index] or {}
+        field = list(player.get("active") or []) + list(player.get("bench") or [])
+        for pokemon in field:
+            if not isinstance(pokemon, dict) or int(pokemon.get("id", -1)) != GREAT_TUSK:
+                continue
+            energies = pokemon.get("energyCards") or pokemon.get("energies") or []
+            if len(energies) >= 2:
+                return current.get("turn")
+    return None
+
+
+def classify_failure(row: dict[str, Any]) -> list[str]:
+    if row.get("reward", 0) >= 0:
+        return []
+    labels: list[str] = []
+    target_deck = row.get("target_deck_remaining")
+    opponent_deck = row.get("opponent_deck_remaining")
+    collapse_count = int(row.get("land_collapse_count") or 0)
+    first_collapse = row.get("first_land_collapse_turn")
+    if target_deck == 0 and isinstance(opponent_deck, int) and opponent_deck > 0:
+        labels.append("self_deckout")
+    if collapse_count == 0:
+        labels.append("no_land_collapse")
+    elif isinstance(first_collapse, int) and first_collapse >= 12:
+        labels.append("late_land_collapse")
+    if row.get("target_prizes_remaining") == 6:
+        labels.append("no_prizes_taken")
+    if row.get("opponent_archetype") in {"crustle", "great_tusk"}:
+        labels.append("wall_or_mirror")
+    if row.get("opponent_archetype") == "mega_abomasnow" and "self_deckout" in labels:
+        labels.append("abomasnow_route_failure")
+    if not labels:
+        labels.append("prize_race_or_other")
+    return labels
+
+
 def last_attack(events: list[dict[str, Any]], attacker: int) -> tuple[int | None, int | None]:
     for event in reversed(events):
         if event.get("type") == 15 and int(event.get("playerIndex", -1)) == attacker:
@@ -146,7 +218,10 @@ def build_rows(log_root: Path, submission_ids: list[int]) -> list[dict[str, Any]
 
     rows = []
     for (submission_id, episode_id), episode in sorted(episode_records.items()):
-        replay = load_json(log_root / "replays" / f"{episode_id}.json")
+        replay_path = log_root / "replays" / f"{episode_id}.json"
+        if not replay_path.exists():
+            continue
+        replay = load_json(replay_path)
         target_index = player_index(episode, submission_id)
         opponent_index = 1 - target_index
         target_agent = episode["agents"][target_index]
@@ -160,11 +235,12 @@ def build_rows(log_root: Path, submission_ids: list[int]) -> list[dict[str, Any]
         end_overage, min_overage = remaining_overage(replay, target_index)
         reward = int(target_agent.get("reward", replay.get("rewards", [0, 0])[target_index] or 0))
         events = unique_events(replay)
+        timed_events = timeline_events(replay)
+        metrics = attack_metrics(timed_events, target_index)
         finisher_card, finisher_attack = last_attack(events, opponent_index if reward < 0 else target_index)
         start = parse_time(episode.get("createTime"))
         end = parse_time(episode.get("endTime"))
-        rows.append(
-            {
+        row = {
                 "submission_id": submission_id,
                 "public_score": scores.get(submission_id),
                 "episode_id": episode_id,
@@ -199,8 +275,18 @@ def build_rows(log_root: Path, submission_ids: list[int]) -> list[dict[str, Any]
                 "finisher_attack": finisher_attack,
                 "end_overage_seconds": end_overage,
                 "min_overage_seconds": min_overage,
+                "first_ready_tusk_turn": first_ready_tusk_turn(replay, target_index),
+                **metrics,
             }
+        row["rating_delta"] = (
+            float(row["updated_score"]) - float(row["initial_score"])
+            if isinstance(row.get("updated_score"), (int, float)) and isinstance(row.get("initial_score"), (int, float))
+            else None
         )
+        failures = classify_failure(row)
+        row["failure_class"] = failures[0] if failures else ""
+        row["failure_tags"] = ",".join(failures)
+        rows.append(row)
     return rows
 
 
@@ -227,6 +313,14 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "draws": sum(row["reward"] == 0 for row in subset),
             "by_archetype": {},
             "by_first_player": {},
+            "by_archetype_and_order": {},
+            "failure_classes": Counter(
+                tag
+                for row in subset
+                if row["reward"] < 0
+                for tag in str(row.get("failure_tags", "")).split(",")
+                if tag
+            ).most_common(),
             "loss_finishers": Counter(
                 str(row["finisher_card"]) for row in subset if row["reward"] < 0 and row["finisher_card"] is not None
             ).most_common(),
@@ -241,6 +335,12 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "wins": wins,
                 "losses": sum(row["reward"] < 0 for row in group),
                 "win_rate": ratio(wins, len(group)),
+                "mean_rating_delta": (
+                    sum(float(row["rating_delta"]) for row in group if isinstance(row.get("rating_delta"), (int, float)))
+                    / sum(isinstance(row.get("rating_delta"), (int, float)) for row in group)
+                    if any(isinstance(row.get("rating_delta"), (int, float)) for row in group)
+                    else None
+                ),
             }
         for label, went_first in (("first", True), ("second", False)):
             group = [row for row in subset if row["went_first"] is went_first]
@@ -251,6 +351,20 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "losses": sum(row["reward"] < 0 for row in group),
                 "win_rate": ratio(wins, len(group)),
             }
+        for archetype in sorted({row["opponent_archetype"] for row in subset}):
+            summary["by_archetype_and_order"][archetype] = {}
+            for label, went_first in (("first", True), ("second", False)):
+                group = [
+                    row for row in subset
+                    if row["opponent_archetype"] == archetype and row["went_first"] is went_first
+                ]
+                wins = sum(row["reward"] > 0 for row in group)
+                summary["by_archetype_and_order"][archetype][label] = {
+                    "games": len(group),
+                    "wins": wins,
+                    "losses": sum(row["reward"] < 0 for row in group),
+                    "win_rate": ratio(wins, len(group)),
+                }
         report["submissions"][str(submission_id)] = summary
     return report
 

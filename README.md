@@ -1,5 +1,7 @@
 # Pokémon TCG AI Agent
 
+私有 champion/challenger 流程见 `docs/KAGGLE_GOLD_LOOP.md`；keidroid Ogerpon 前100搜索见 `docs/OGERPON_FRONT100_SEARCH.md`，教师初始化残差 Q、真实 CG belief search 与 CEM 闭环见 `docs/OGERPON_RESIDUAL_OPTIMIZATION.md`；排行榜回放大池见 `docs/OPPONENT_LEAGUE.md`；评估器一致性与排行榜校准见 `docs/KAGGLE_EVALUATOR_PARITY.md`；完整策略、牌组、提交类型和历史表现见 `docs/STRATEGY_PORTFOLIO.md`。竞争牌组、回放模型和提交状态默认保存在已忽略路径中。
+
 一个面向 **Pokémon TCG AI Battle / Kaggle 风格对战环境** 的完整策略研发项目。
 
 本仓库不只是一个可提交的 `agent()`，还包含：
@@ -18,6 +20,7 @@
 
 - [项目特点](#项目特点)
 - [Replay 驱动优化](#replay-驱动优化)
+- [策略组合与历史表现](#策略组合与历史表现)
 - [策略概览](#策略概览)
 - [架构](#架构)
 - [运行要求](#运行要求)
@@ -73,9 +76,26 @@
 
 ## Replay 驱动优化
 
-最新一轮工作从真实 Kaggle episode 中提取失败模式，修复了 Hariyama 进化抑制、Great Tusk 镜像自我牌库耗尽、Alakazam 大手牌缺少干扰，以及多个主流攻击手威胁估值缺失的问题。原始日志和 replay 恢复出的竞争性资产不会提交到仓库。
+最新一轮工作从真实 Kaggle episode 中提取失败模式，加入 Great Tusk 晚期自我牌库保护、按手牌资源动态选择首发、终盘 Crustle 墙路线，并修复本地评测把对手导入/牌组失败错误记为胜利的问题。原始日志和 replay 恢复出的竞争性资产不会提交到仓库。
 
 完整诊断、修复清单、工具用法和验证原则见 `docs/KAGGLE_REPLAY_OPTIMIZATION.md`。
+
+## 策略组合与历史表现
+
+当前代码和已生成自有提交包含 **6 个核心策略家族、11 套去重牌表和 4 类主要提交逻辑**：
+
+- **Great Tusk**：牌库破坏、资源干扰、Crustle 防守墙和应急 KO；
+- **Mega Lucario**：快速进化、正面奖赏竞速和隐藏世界短程搜索；
+- **Grimmsnarl**：进化攻击、伤害计数器和后备目标控制；
+- **Mega Kangaskhan**：多属性能量、多攻击手和 Ogerpon 引擎；
+- **Mega Lopunny**：Dudunsparce 循环、跨回合记忆和攻击窗口管理；
+- **Teal Mask Ogerpon**：单教师回放克隆、Teal Dance 加速和多 Ogerpon 能量攻击。
+
+提交逻辑分为原生规则、Meta Rules、Clone 和 Clone Search。Lopunny 的 `baseline`、`attack`、`cycle`、`full` 属于同一家族的 profile，不重复计为新策略。
+
+截至 **2026-08-03** 的内部快照中，Great Tusk `gt_anti_crustle` 拥有当前最强可靠自有历史线上记录 `794.6`；Lopunny 在部分服务器 holdout 中表现突出但尚未在线验证；Ogerpon `deep_v2` 行为一致率达到 `94.90%`，而已提交的 `balanced_v2` Kaggle 分数为 `600.0`。这些结果同时说明本地胜率、行为一致率和 Kaggle 分数之间仍存在明显偏差。
+
+详细牌表核心、教师来源、候选路径、优缺点、服务器评测、submission ID 和数据质量说明见内部文档 `docs/STRATEGY_PORTFOLIO.md`。
 
 ## 策略概览
 

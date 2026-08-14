@@ -38,6 +38,8 @@ class KaggleStyleRating:
         return RatingState(self.env.create_rating())
 
     def update_game(self, p0: RatingState, p1: RatingState, result: GameResult) -> tuple[RatingState, RatingState]:
+        if not result.ranking_eligible:
+            return p0, p1
         if result.outcome == "DRAW":
             ranks = [0, 0]
         elif result.winner == result.p0:

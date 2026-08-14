@@ -216,10 +216,9 @@ def diagnose(args: argparse.Namespace) -> dict[str, Any]:
     pool = args.pool or default_pool()
     tarballs = [args.candidate, *pool]
     cfg = EvalConfig(
+        profile="kaggle",
         seed=args.seed,
         workers=max(1, args.workers),
-        max_actions=args.max_actions,
-        run_timeout_s=args.run_timeout,
         record_mode=args.record_mode,
         record_sample_rate=args.record_sample_rate,
         record_gzip=args.record_gzip,

@@ -1,0 +1,19 @@
+{
+  "family": "teal_ogerpon",
+  "seed": 20260803,
+  "n_estimators": 650,
+  "learning_rate": 0.022,
+  "num_leaves": 63,
+  "min_child_samples": 8,
+  "win_weight": 1.0,
+  "loss_weight": 1.0,
+  "n_jobs": 12,
+  "sources": [
+    {
+      "name": "keidroid_current",
+      "path": "outputs/kaggle_logs/top_leaders_20260802/keidroid_55153405",
+      "target_name": "keidroid",
+      "split": "train"
+    }
+  ]
+}

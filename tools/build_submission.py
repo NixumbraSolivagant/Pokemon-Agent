@@ -167,6 +167,10 @@ def _gt_eval_state(obs, me_idx):
         value -= (6 - my_deck) * _gt_weight("self_deckout_penalty", 12000.0)
     value += (getattr(me, "handCount", 0) - getattr(opp, "handCount", 0)) * _gt_weight("hand_delta", 45.0)
     value += (my_deck - opp_deck) * _gt_weight("deck_delta", 30.0)
+    flags = _gt_policy_flags()
+    if flags.intersection({"anti_deckout", "adaptive_race", "late_deck_guard"}) and opp_deck > 4:
+        unsafe_gap = max(0, opp_deck + int(_gt_weight("deck_safety_margin", 3.0)) - my_deck)
+        value -= unsafe_gap * _gt_weight("unwinnable_mill_penalty", 6500.0)
 
     hand = list(getattr(me, "hand", []) or [])
     hand_ids = [getattr(card, "id", None) for card in hand]
@@ -219,6 +223,56 @@ def _gt_eval_state(obs, me_idx):
     return value
 
 
+def _gt_policy_route(me, opponent):
+    flags = _gt_policy_flags()
+    route = GT_POLICY_VARIANT.replace("synthetic_", "").split("+", 1)[0]
+    aliases = {
+        "fast_ko": "ko_first",
+        "slow_ko": "ko_first",
+        "bench_pressure": "ko_first",
+        "wall": "wall_first",
+        "mill": "mill_first",
+        "denial": "resource_denial",
+        "setup_first": "mill_first",
+        "anti_deckout": "mill_first",
+        "adaptive_race": "mill_first",
+    }
+    route = aliases.get(route, route)
+    visible = set(_gt_visible_ids(opponent))
+    if "anti_crustle" in flags and visible.intersection({344, 345}):
+        return "resource_denial"
+    if "anti_abomasnow" in flags and visible.intersection({722, 723}):
+        return "ko_first"
+    if flags.intersection({"anti_deckout", "adaptive_race"}):
+        margin = int(_gt_weight("deck_safety_margin", 3.0))
+        if opponent.deckCount > 7 and me.deckCount <= opponent.deckCount + margin:
+            return "ko_first"
+    if "endgame_wall" in flags and len(getattr(opponent, "prize", []) or []) <= 2:
+        if opponent.deckCount > 4 and not has_ready_tusk(me):
+            return "wall_first"
+    return route
+
+
+def _gt_policy_flags():
+    return set(GT_POLICY_VARIANT.replace("synthetic_", "").split("+"))
+
+
+def _gt_unsafe_self_thin(me, opponent):
+    flags = _gt_policy_flags()
+    if "late_deck_guard" in flags:
+        return opponent.deckCount > 2 and me.deckCount <= 8 and me.deckCount <= opponent.deckCount + 2
+    if not flags.intersection({"anti_deckout", "adaptive_race"}):
+        return False
+    margin = int(_gt_weight("deck_safety_margin", 3.0))
+    return opponent.deckCount > 4 and me.deckCount <= max(7, opponent.deckCount + margin)
+
+
+def _gt_viable_tusk_open(me):
+    hand_ids = {getattr(card, "id", None) for card in getattr(me, "hand", []) or []}
+    setup_cards = ENERGY_IDS | {FIGHT_GONG, ULTRA_BALL, BUG_CATCHING_SET, POKE_PAD, POKEGEAR_30, ROTO_STICK}
+    return bool(hand_ids.intersection(setup_cards))
+
+
 def _gt_option_tactical_bonus(obs, option, score):
     state = obs.current
     select = obs.select
@@ -227,15 +281,9 @@ def _gt_option_tactical_bonus(obs, option, score):
     active = active_pokemon(me)
     bonus = 0
     try:
-        route = GT_POLICY_VARIANT.replace("synthetic_", "")
-        route = {
-            "fast_ko": "ko_first",
-            "slow_ko": "ko_first",
-            "bench_pressure": "ko_first",
-            "wall": "wall_first",
-            "mill": "mill_first",
-            "denial": "resource_denial",
-        }.get(route, route)
+        flags = _gt_policy_flags()
+        route = _gt_policy_route(me, opponent)
+        unsafe_self_thin = _gt_unsafe_self_thin(me, opponent)
         if select.context == SelectContext.MAIN:
             if option.type == OptionType.PLAY:
                 card = get_card(obs, AreaType.HAND, option.index, state.yourIndex)
@@ -245,7 +293,9 @@ def _gt_option_tactical_bonus(obs, option, score):
                     if route == "mill_first":
                         bonus += 240000
                 elif cid in (POKEGEAR_30, POKE_PAD, ULTRA_BALL, FIGHT_GONG, BUDDY_BUDDY_POFFIN):
-                    bonus += 220000
+                    bonus += -420000 if unsafe_self_thin else 220000
+                    if "setup_first" in flags and not has_ready_tusk(me):
+                        bonus += 260000
                 elif cid in (ERI, XEROSIC_SCHEME, HAND_TRIMMER, ENHANCED_HAMMER, ENERGY_LASSO, FLUTE):
                     bonus += 160000
                     if route == "resource_denial":
@@ -258,6 +308,8 @@ def _gt_option_tactical_bonus(obs, option, score):
                     bonus += 75000 if opponent.deckCount <= 16 else 25000
             elif option.type == OptionType.ATTACH:
                 bonus += 180000
+                if "setup_first" in flags and not has_ready_tusk(me):
+                    bonus += 260000
             elif option.type == OptionType.EVOLVE:
                 bonus += 160000
                 if route == "wall_first":
@@ -279,15 +331,21 @@ def _gt_option_tactical_bonus(obs, option, score):
                     if state.supporterPlayed:
                         bonus += 320000
             elif option.type == OptionType.END:
-                bonus -= 350000
+                bonus += 180000 if unsafe_self_thin else -350000
         elif option.type == OptionType.CARD:
             card = get_card(obs, option.area, option.index, option.playerIndex)
             cid = getattr(card, "id", None)
-            if select.context == SelectContext.TO_HAND:
+            if select.context == SelectContext.SETUP_ACTIVE_POKEMON:
+                if "tusk_lead" in flags and cid == GREAT_TUSK and _gt_viable_tusk_open(me):
+                    bonus += 420000
+            elif select.context in (SelectContext.SETUP_BENCH_POKEMON, SelectContext.TO_BENCH, SelectContext.TO_FIELD):
+                if "tusk_lead" in flags and cid == GREAT_TUSK:
+                    bonus += 260000
+            elif select.context == SelectContext.TO_HAND:
                 if cid == EXPLORER_GUIDANCE:
                     bonus += 500000
                 elif cid in (POKEGEAR_30, POKE_PAD, ULTRA_BALL, FIGHT_GONG, BUDDY_BUDDY_POFFIN):
-                    bonus += 260000
+                    bonus += -320000 if unsafe_self_thin else 260000
                 elif cid in (GREAT_TUSK, DWEBBLE, CRUSTLE):
                     bonus += 220000
                 elif cid in (NIGHT_STRETCHER, SACRED_ASH, ENERGY_RECYCLER):
@@ -331,6 +389,9 @@ def _gt_score_options_from_observation(obs):
         wall_mode = should_wall_mode(me, opponent, state)
     except Exception:
         wall_mode = False
+    if "endgame_wall" in _gt_policy_flags() and len(getattr(opponent, "prize", []) or []) <= 2:
+        if opponent.deckCount > 4 and not has_ready_tusk(me):
+            wall_mode = True
     try:
         ko_mode = should_ko_mode(me, opponent, state)
     except Exception:
@@ -411,6 +472,8 @@ def _gt_score_options_from_observation(obs):
                     score = -10 * n
                     if not has_ready_tusk(me) and me.deckCount > 8:
                         score += 18 * n
+                    if _gt_unsafe_self_thin(me, opponent):
+                        score -= int(_gt_weight("unsafe_draw_penalty", 180.0)) * n
                 elif context in (SelectContext.DAMAGE_COUNTER_COUNT, SelectContext.REMOVE_DAMAGE_COUNTER_COUNT):
                     score = n if ko_mode else -n
                 else:

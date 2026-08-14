@@ -59,6 +59,8 @@ class RobustRow:
     wins: int
     losses: int
     no_results: int
+    excluded: int
+    runtime_failures: int
     mean_rate: float
     worst_rate: float
     mean_lower: float
@@ -171,17 +173,20 @@ def evaluate(
     args: argparse.Namespace,
     out: Path,
     seed: int,
+    profile: str = "legacy",
 ) -> MatchReport:
     config = EvalConfig(
+        profile=profile,
         workers=args.workers,
-        run_timeout_s=args.run_timeout,
-        max_actions=args.max_actions,
+        run_timeout_s=args.run_timeout if profile == "legacy" else 2000.0,
+        max_actions=args.max_actions if profile == "legacy" else 10_000_000,
         seed=seed,
         record_mode=args.record_mode,
         record_sample_rate=args.record_sample_rate,
         progress=args.progress,
         progress_label=out.name,
         progress_mode="line",
+        common_random_seeds=profile == "legacy",
     )
     report = run_candidate_pool(candidates, opponents, games_per_pair, config, args.project_root, peer_span=0)
     save_report(report, out)
@@ -191,20 +196,42 @@ def evaluate(
 def rank_report(report: MatchReport, candidates: list[Path], opponents: list[Path]) -> list[RobustRow]:
     candidate_names = {submission_name(path) for path in candidates}
     opponent_names = {submission_name(path) for path in opponents}
+    tarballs = {stats.name: stats.tarball for stats in report.standings}
     rows: list[RobustRow] = []
-    for stats in report.standings:
-        if stats.name not in candidate_names:
-            continue
+    for candidate_name in sorted(candidate_names):
         matchup_rows: dict[str, dict[str, float | int]] = {}
         rates: list[float] = []
         lowers: list[float] = []
-        for opponent_name, values in stats.opponents.items():
-            if opponent_name not in opponent_names:
-                continue
-            wins = int(values.get("wins", 0))
-            losses = int(values.get("losses", 0))
-            draws = int(values.get("draws", 0))
+        total_wins = total_losses = total_draws = total_excluded = runtime_failures = 0
+        for opponent_name in sorted(opponent_names):
+            wins = losses = draws = excluded = failures = 0
+            for game in report.games:
+                if {game.p0, game.p1} != {candidate_name, opponent_name}:
+                    continue
+                if game.reason in {"REFEREE_CRASH", "RUN_TIMEOUT"}:
+                    excluded += 1
+                    continue
+                if game.reason in {"IMPORT_ERROR", "DECK_ERROR"} and game.winner == candidate_name:
+                    excluded += 1
+                    continue
+                if game.reason in {"IMPORT_ERROR", "DECK_ERROR", "TIMEOUT", "INVALID_ACTION", "ENGINE_REJECTED_ACTION"} and game.loser == candidate_name:
+                    failures += 1
+                if game.winner == candidate_name:
+                    wins += 1
+                elif game.loser == candidate_name:
+                    losses += 1
+                elif game.outcome == "DRAW":
+                    draws += 1
+                else:
+                    excluded += 1
             total = wins + losses + draws
+            total_excluded += excluded
+            runtime_failures += failures
+            total_wins += wins
+            total_losses += losses
+            total_draws += draws
+            if total == 0:
+                continue
             rate = (wins + 0.5 * draws) / max(1, total)
             lower = wilson_lower(wins, losses, draws)
             rates.append(rate)
@@ -213,6 +240,8 @@ def rank_report(report: MatchReport, candidates: list[Path], opponents: list[Pat
                 "wins": wins,
                 "losses": losses,
                 "draws": draws,
+                "excluded": excluded,
+                "runtime_failures": failures,
                 "rate": rate,
                 "lower": lower,
             }
@@ -222,16 +251,19 @@ def rank_report(report: MatchReport, candidates: list[Path], opponents: list[Pat
         mean_lower = sum(lowers) / len(lowers)
         worst_rate = min(rates)
         worst_lower = min(lowers)
-        no_result_rate = stats.no_results / max(1, stats.games)
-        robust_score = 0.55 * worst_lower + 0.30 * mean_lower + 0.15 * mean_rate - min(0.25, 4.0 * no_result_rate)
+        valid_games = total_wins + total_losses + total_draws
+        failure_rate = runtime_failures / max(1, valid_games)
+        robust_score = 0.55 * worst_lower + 0.30 * mean_lower + 0.15 * mean_rate - min(0.35, 5.0 * failure_rate)
         rows.append(
             RobustRow(
-                name=stats.name,
-                tarball=stats.tarball,
-                games=stats.games,
-                wins=stats.wins,
-                losses=stats.losses,
-                no_results=stats.no_results,
+                name=candidate_name,
+                tarball=tarballs.get(candidate_name, ""),
+                games=valid_games,
+                wins=total_wins,
+                losses=total_losses,
+                no_results=total_draws,
+                excluded=total_excluded,
+                runtime_failures=runtime_failures,
                 mean_rate=mean_rate,
                 worst_rate=worst_rate,
                 mean_lower=mean_lower,
@@ -240,7 +272,7 @@ def rank_report(report: MatchReport, candidates: list[Path], opponents: list[Pat
                 matchups=matchup_rows,
             )
         )
-    rows.sort(key=lambda row: (row.robust_score, row.worst_lower, row.mean_lower, -row.no_results), reverse=True)
+    rows.sort(key=lambda row: (row.robust_score, row.worst_lower, row.mean_lower, -row.runtime_failures), reverse=True)
     return rows
 
 
@@ -250,7 +282,7 @@ def write_ranking(path: Path, rows: list[RobustRow]) -> None:
     with path.with_suffix(".csv").open("w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(
             file,
-            fieldnames=("name", "games", "wins", "losses", "no_results", "mean_rate", "worst_rate", "mean_lower", "worst_lower", "robust_score", "tarball"),
+            fieldnames=("name", "games", "wins", "losses", "no_results", "excluded", "runtime_failures", "mean_rate", "worst_rate", "mean_lower", "worst_lower", "robust_score", "tarball"),
         )
         writer.writeheader()
         for row in rows:
@@ -311,7 +343,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     finalists = [Path(row["tarball"]) for row in combined[: args.finalists]]
 
     final_opponents = unique_paths([*args.train_pool, *args.holdout_pool])
-    final_report = evaluate(finalists, final_opponents, args.final_games, args, out / "final", args.seed + 300000)
+    final_report = evaluate(finalists, final_opponents, args.final_games, args, out / "final", args.seed + 300000, profile="kaggle")
     final_rows = rank_report(final_report, finalists, final_opponents)
     write_ranking(out / "final_ranking.json", final_rows)
     if not final_rows:

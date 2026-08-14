@@ -371,10 +371,8 @@ def opponent_self_deck_pressure(opponent) -> bool:
     return False
 
 def own_deck_safety_guard(me, opponent) -> bool:
-    # Only stop optional self-thinning when the opponent itself is already burning deck fast.
-    if not opponent_self_deck_pressure(opponent):
-        return False
-    return me.deckCount <= max(8, opponent.deckCount + 4) and opponent.deckCount > 4
+    # Late self-mill is a shared resource race, not only an Abomasnow matchup.
+    return me.deckCount <= 8 and opponent.deckCount > 2 and me.deckCount <= opponent.deckCount + 2
 
 def desired_field_floor(me, opponent, state) -> int:
     if facing_lucario_strong(opponent):
@@ -400,9 +398,13 @@ def should_wall_mode(me, opponent, state) -> bool:
     # A live boosted mill turn is worth more than moving into the wall.
     if active_tusk_ready(me) and count_in_hand(me, EXPLORER_GUIDANCE) > 0 and not state.supporterPlayed:
         return False
-    if opponent.deckCount <= 20:
-        return False
     active = active_pokemon(me)
+    tusk_ready = has_ready_tusk(me)
+    crustle_available = has_in_field(me, CRUSTLE) or has_in_field(me, DWEBBLE) or count_in_hand(me, DWEBBLE) or count_in_hand(me, CRUSTLE)
+    if len(opponent.prize) <= 2 and opponent.deckCount > 4 and not tusk_ready and crustle_available:
+        return True
+    if opponent.deckCount <= 4 and tusk_ready:
+        return False
     stadium_id = state.stadium[0].id if state.stadium else None
     if stadium_id == NEUTRAL_CENTER and active is not None and not is_ex_pokemon(active):
         # Neutralization Zone already turns Great Tusk into the preferred wall,
@@ -503,13 +505,16 @@ def can_bench_more(player) -> bool:
 
 
 def initial_active_score(card_id: int, me, opponent) -> int:
-    # Lead with a disposable/setup body and preserve the mill attacker.
+    hand_ids = {card.id for card in (me.hand or [])}
+    tusk_package = bool(hand_ids & ENERGY_IDS) or bool(
+        {FIGHT_GONG, ULTRA_BALL, BUG_CATCHING_SET, POKE_PAD, POKEGEAR_30, ROTO_STICK} & hand_ids
+    )
     if card_id == DWEBBLE:
-        return 12500
+        return 14500 if not tusk_package else 8500
     if card_id == TATSUGIRI:
         return 9800
     if card_id == GREAT_TUSK:
-        return 3500
+        return 15500 if tusk_package else 2500
     if card_id == FLUTTER_MANE:
         return 7000
     if card_id == CORNERSTONE_OGERPON:
@@ -607,6 +612,10 @@ def play_score(card_id: int, me, opponent, state, wall_mode: bool, ko_mode: bool
     active_ready_tusk = active is not None and active.id == GREAT_TUSK and can_pay_attack(active, LAND_COLLAPSE)
     has_explorer = count_in_hand(me, EXPLORER_GUIDANCE) > 0
     score = -10000
+    if own_deck_safety_guard(me, opponent) and card_id in {
+        POKEGEAR_30, POKE_PAD, FIGHT_GONG, BUDDY_BUDDY_POFFIN, ULTRA_BALL, ROTO_STICK,
+    }:
+        return -60000
 
     if card_id == EXPLORER_GUIDANCE:
         if not state.supporterPlayed and active_ready_tusk and me.deckCount >= 6:
@@ -1246,7 +1255,9 @@ def _agent(obs_dict: dict) -> list[int]:
             if context == SelectContext.DRAW_COUNT:
                 # Do not over-protect deck if drawing/searching unlocks Tusk mill.
                 score = -10 * n
-                if not has_ready_tusk(me) and me.deckCount > 8:
+                if own_deck_safety_guard(me, opponent):
+                    score -= 1800 * n
+                elif not has_ready_tusk(me) and me.deckCount > 8:
                     score += 18 * n
             elif context in (SelectContext.DAMAGE_COUNTER_COUNT, SelectContext.REMOVE_DAMAGE_COUNTER_COUNT):
                 score = n if ko_mode else -n
@@ -1490,6 +1501,8 @@ def _gt_option_tactical_bonus(obs, option, score):
             "mill": "mill_first",
             "denial": "resource_denial",
         }.get(route, route)
+        hand_ids = {getattr(card, "id", None) for card in getattr(me, "hand", []) or []}
+        unsafe_self_thin = me.deckCount <= 8 and opponent.deckCount > 2 and me.deckCount <= opponent.deckCount + 2
         if select.context == SelectContext.MAIN:
             if option.type == OptionType.PLAY:
                 card = get_card(obs, AreaType.HAND, option.index, state.yourIndex)
@@ -1499,7 +1512,7 @@ def _gt_option_tactical_bonus(obs, option, score):
                     if route == "mill_first":
                         bonus += 240000
                 elif cid in (POKEGEAR_30, POKE_PAD, ULTRA_BALL, FIGHT_GONG, BUDDY_BUDDY_POFFIN):
-                    bonus += 220000
+                    bonus += -500000 if unsafe_self_thin else 220000
                 elif cid in (ERI, XEROSIC_SCHEME, HAND_TRIMMER, ENHANCED_HAMMER, ENERGY_LASSO, FLUTE):
                     bonus += 160000
                     if route == "resource_denial":

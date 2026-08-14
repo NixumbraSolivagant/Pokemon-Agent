@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Private Kaggle evaluator calibration config",
+  "type": "object",
+  "required": ["competition", "team_id", "submissions", "opponents"],
+  "properties": {
+    "competition": {"type": "string"},
+    "team_id": {"type": "integer"},
+    "excluded_submission_ids": {"type": "array", "items": {"type": "integer"}},
+    "games_per_pair": {"type": "integer", "minimum": 1},
+    "seat_weights": {
+      "type": "object",
+      "properties": {
+        "0": {"type": "number", "exclusiveMinimum": 0},
+        "1": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "submissions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["submission_id", "package", "package_sha256", "confirmed"],
+        "properties": {
+          "submission_id": {"type": "integer"},
+          "package": {"type": "string"},
+          "package_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "observed_public_score": {"type": ["number", "null"]},
+          "observed_at": {"type": ["string", "null"]},
+          "confirmed": {"type": "boolean"},
+          "local_report": {"type": ["string", "null"]}
+        }
+      }
+    },
+    "opponents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "package", "weight"],
+        "properties": {
+          "name": {"type": "string"},
+          "package": {"type": "string"},
+          "weight": {"type": "number", "exclusiveMinimum": 0},
+          "submission_ids": {"type": "array", "items": {"type": "integer"}}
+        }
+      }
+    }
+  }
+}

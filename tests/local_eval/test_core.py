@@ -217,6 +217,24 @@ def test_losses_record_mode_keeps_decisive_losses_without_focus():
     assert _should_keep_trace(result, EvalConfig(record_mode="losses")) is True
 
 
+def test_training_record_mode_keeps_focus_games():
+    result = GameResult(
+        game_id="g0",
+        p0="ogerpon",
+        p1="opponent",
+        seed=1,
+        result=0,
+        outcome="P0_WIN",
+        winner="ogerpon",
+        loser="opponent",
+        reason="RESULT",
+        actions=10,
+        duration_s=1.0,
+    )
+    assert _should_keep_trace(result, EvalConfig(record_mode="training", record_focus="ogerpon")) is True
+    assert _should_keep_trace(result, EvalConfig(record_mode="training", record_focus="missing")) is False
+
+
 def test_run_match_can_print_progress(tmp_path: Path, capsys):
     baseline = Path("基准/submission_sorce_700.tar.gz")
     report = run_match(

@@ -20,5 +20,17 @@ kag.zip
 # intentionally not versioned.
 configs/kaggle_replay_opponent_models.json
 configs/replay_restored_826_deck.csv
+configs/great_tusk_gold_private.json
+configs/great_tusk_gold_phase2_private.json
+configs/great_tusk_online_losses_private.json
+configs/kaggle_gold_private.json
+configs/kaggle_eval_calibration_private.json
+configs/*_private.json
 
 参考/
+
+configs/great_tusk_fixed_confirmation_private.json
+configs/meta_imitation_grim_private.json
+configs/meta_imitation_kang_private.json
+configs/meta_imitation_ntuml_private.json
+outputs/meta_imitation/

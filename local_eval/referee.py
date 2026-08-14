@@ -13,7 +13,7 @@ from typing import Any
 
 from .archive import cached_extract_tar_gz, safe_extract_tar_gz
 from .models import EvalConfig, GameResult
-from .player import PlayerProcess
+from .player import PlayerProcess, PlayerProtocolError
 
 
 class InvalidAction(ValueError):
@@ -85,6 +85,28 @@ def validate_deck(deck: Any) -> list[int]:
     return deck
 
 
+def validate_kaggle_deck_action(deck: Any) -> list[int]:
+    if not isinstance(deck, list):
+        raise InvalidAction("deck selection must be an array")
+    if len(deck) != 60:
+        raise InvalidAction("deck selection must return exactly 60 ints")
+    return deck
+
+
+def _validate_deck_for_profile(deck: Any, config: EvalConfig) -> list[int]:
+    if config.profile == "kaggle":
+        return validate_kaggle_deck_action(deck)
+    return validate_deck(deck)
+
+
+def _validate_action_for_profile(obs: dict[str, Any], action: Any, config: EvalConfig) -> list[Any]:
+    if config.profile == "kaggle":
+        if not isinstance(action, list):
+            raise InvalidAction("action must be an array")
+        return action
+    return validate_action(obs, action)
+
+
 def play_game(
     p0_tarball: str,
     p1_tarball: str,
@@ -132,11 +154,13 @@ def play_game(
                 outcome="NO_RESULT",
                 winner=None,
                 loser=None,
-                reason="RUN_TIMEOUT",
+                reason="HARNESS_FAILURE" if config.profile == "kaggle" else "RUN_TIMEOUT",
                 actions=max(0, len([e for e in trace if e.get("event") == "action"])),
                 duration_s=time.perf_counter() - started,
                 error=f"Game exceeded run timeout {config.run_timeout_s}s",
                 trace=trace,
+                failure_class="HARNESS_FAILURE",
+                ranking_eligible=False,
             )
             if not _should_keep_trace(result, config):
                 result.trace = []
@@ -151,11 +175,13 @@ def play_game(
                 outcome="NO_RESULT",
                 winner=None,
                 loser=None,
-                reason="REFEREE_CRASH",
+                reason="HARNESS_FAILURE" if config.profile == "kaggle" else "REFEREE_CRASH",
                 actions=0,
                 duration_s=time.perf_counter() - started,
                 error=f"Worker exited with code {proc.exitcode}",
                 trace=_read_trace(trace_path),
+                failure_class="HARNESS_FAILURE",
+                ranking_eligible=False,
             )
             if not _should_keep_trace(result, config):
                 result.trace = []
@@ -205,22 +231,49 @@ def _play_game_worker(
             try:
                 p0.start()
             except Exception as exc:
-                queue.put(_forfeit(game_id, p0_name, p1_name, seed, 0, "IMPORT_ERROR", actions, started, str(exc)))
+                queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, 0, "IMPORT_ERROR", "ERROR", actions, started, str(exc), initial=True))
                 return
             try:
                 p1.start()
             except Exception as exc:
-                queue.put(_forfeit(game_id, p0_name, p1_name, seed, 1, "IMPORT_ERROR", actions, started, str(exc)))
+                queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, 1, "IMPORT_ERROR", "ERROR", actions, started, str(exc), initial=True))
+                return
+            overage = {0: config.overage_time_s, 1: config.overage_time_s}
+            try:
+                deck_timeout0 = config.act_timeout_s + overage[0] if config.profile == "kaggle" else config.deck_timeout_s
+                raw_deck0, deck_duration0 = p0.request({"kind": "deck"}, deck_timeout0)
+                if config.profile == "kaggle":
+                    overage[0] -= max(0.0, deck_duration0 - config.act_timeout_s)
+                    if overage[0] < 0:
+                        raise TimeoutError("remainingOverageTime below 0 after deck action")
+                deck0 = _validate_deck_for_profile(raw_deck0, config)
+            except TimeoutError as exc:
+                reason = "DECK_TIMEOUT" if config.profile == "kaggle" else "DECK_ERROR"
+                queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, 0, reason, "TIMEOUT", actions, started, str(exc), initial=True))
+                return
+            except PlayerProtocolError as exc:
+                queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, 0, "DECK_ERROR", "ERROR", actions, started, str(exc), initial=True))
+                return
+            except Exception as exc:
+                queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, 0, "DECK_ERROR", "INVALID", actions, started, str(exc), initial=True))
                 return
             try:
-                deck0 = validate_deck(p0.request({"kind": "deck"}, config.deck_timeout_s)[0])
-            except Exception as exc:
-                queue.put(_forfeit(game_id, p0_name, p1_name, seed, 0, "DECK_ERROR", actions, started, str(exc)))
+                deck_timeout1 = config.act_timeout_s + overage[1] if config.profile == "kaggle" else config.deck_timeout_s
+                raw_deck1, deck_duration1 = p1.request({"kind": "deck"}, deck_timeout1)
+                if config.profile == "kaggle":
+                    overage[1] -= max(0.0, deck_duration1 - config.act_timeout_s)
+                    if overage[1] < 0:
+                        raise TimeoutError("remainingOverageTime below 0 after deck action")
+                deck1 = _validate_deck_for_profile(raw_deck1, config)
+            except TimeoutError as exc:
+                reason = "DECK_TIMEOUT" if config.profile == "kaggle" else "DECK_ERROR"
+                queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, 1, reason, "TIMEOUT", actions, started, str(exc), initial=True))
                 return
-            try:
-                deck1 = validate_deck(p1.request({"kind": "deck"}, config.deck_timeout_s)[0])
+            except PlayerProtocolError as exc:
+                queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, 1, "DECK_ERROR", "ERROR", actions, started, str(exc), initial=True))
+                return
             except Exception as exc:
-                queue.put(_forfeit(game_id, p0_name, p1_name, seed, 1, "DECK_ERROR", actions, started, str(exc)))
+                queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, 1, "DECK_ERROR", "INVALID", actions, started, str(exc), initial=True))
                 return
             if record_trace:
                 _write_trace(trace_file, {
@@ -230,8 +283,11 @@ def _play_game_worker(
                     "p0_deck": deck0,
                     "p1_deck": deck1,
                 })
-            overage = {0: config.overage_time_s, 1: config.overage_time_s}
-            obs, _ = battle_start(deck0, deck1)
+            obs, start_data = battle_start(deck0, deck1)
+            if config.profile == "kaggle" and start_data.errorPlayer >= 0:
+                bad_seat = int(start_data.errorPlayer)
+                queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, bad_seat, "ENGINE_DECK_ERROR", "INVALID", actions, started, f"Player {bad_seat}'s deck error.", initial=True))
+                return
             if obs is None:
                 raise RuntimeError("cg.battle_start returned None")
 
@@ -245,12 +301,17 @@ def _play_game_worker(
                     player_idx = int(cur.get("yourIndex", 0))
                     actor = p0 if player_idx == 0 else p1
                     assert actor is not None
+                    actor_name = p0_name if player_idx == 0 else p1_name
+                    training_focus = (config.record_mode or "").lower() == "training" and (
+                        not config.record_focus or config.record_focus == actor_name
+                    )
                     step_record: dict[str, Any] = {
                         "event": "action",
                         "step": actions,
                         "actor_seat": player_idx,
-                        "actor": p0_name if player_idx == 0 else p1_name,
-                        "observation": _summarize_observation(obs),
+                        "actor": actor_name,
+                        "observation": obs if training_focus else _summarize_observation(obs),
+                        "training_state": training_focus,
                     }
                     try:
                         allowed_s = config.act_timeout_s + max(0.0, overage[player_idx])
@@ -260,24 +321,30 @@ def _play_game_worker(
                             raise TimeoutError(
                                 f"remainingOverageTime below 0 after {duration:.3f}s action"
                             )
-                        action = validate_action(obs, raw_action)
+                        action = _validate_action_for_profile(obs, raw_action, config)
                         step_record["raw_action"] = raw_action
                         step_record["action"] = action
                         step_record["duration_s"] = duration
                         step_record["remaining_overage_s"] = overage[player_idx]
-                        step_record["selected_options"] = _selected_options(obs, action)
+                        step_record["selected_options"] = _selected_options_safe(obs, action)
                     except TimeoutError as exc:
                         step_record["error"] = str(exc)
                         if record_trace:
                             _write_trace(trace_file, step_record)
-                        queue.put(_forfeit(game_id, p0_name, p1_name, seed, player_idx, "TIMEOUT", actions, started, str(exc)))
+                        queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, player_idx, "TIMEOUT", "TIMEOUT", actions, started, str(exc)))
+                        return
+                    except PlayerProtocolError as exc:
+                        step_record["error"] = str(exc)
+                        if record_trace:
+                            _write_trace(trace_file, step_record)
+                        queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, player_idx, "AGENT_ERROR", "ERROR", actions, started, str(exc)))
                         return
                     except Exception as exc:
                         step_record["raw_action"] = locals().get("raw_action")
                         step_record["error"] = str(exc)
                         if record_trace:
                             _write_trace(trace_file, step_record)
-                        queue.put(_forfeit(game_id, p0_name, p1_name, seed, player_idx, "INVALID_ACTION", actions, started, str(exc)))
+                        queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, player_idx, "INVALID_ACTION", "INVALID", actions, started, str(exc)))
                         return
                     actions += 1
                     try:
@@ -289,7 +356,7 @@ def _play_game_worker(
                         step_record["error"] = str(exc)
                         if record_trace:
                             _write_trace(trace_file, step_record)
-                        queue.put(_forfeit(game_id, p0_name, p1_name, seed, player_idx, "ENGINE_REJECTED_ACTION", actions, started, str(exc)))
+                        queue.put(_agent_failure(config, game_id, p0_name, p1_name, seed, player_idx, "ENGINE_REJECTED_ACTION", "INVALID", actions, started, str(exc)))
                         return
                 queue.put(
                     GameResult(
@@ -301,9 +368,11 @@ def _play_game_worker(
                         outcome="NO_RESULT",
                         winner=None,
                         loser=None,
-                        reason="MAX_ACTIONS",
+                        reason="EPISODE_STEP_LIMIT" if config.profile == "kaggle" else "MAX_ACTIONS",
                         actions=actions,
                         duration_s=time.perf_counter() - started,
+                        p0_status="DONE",
+                        p1_status="DONE",
                     )
                 )
             finally:
@@ -322,10 +391,12 @@ def _play_game_worker(
                 outcome="NO_RESULT",
                 winner=None,
                 loser=None,
-                reason="REFEREE_CRASH",
+                reason="HARNESS_FAILURE" if config.profile == "kaggle" else "REFEREE_CRASH",
                 actions=actions,
                 duration_s=time.perf_counter() - started,
                 error=f"{type(exc).__name__}: {exc}",
+                failure_class="HARNESS_FAILURE",
+                ranking_eligible=False,
             )
         )
     finally:
@@ -346,10 +417,76 @@ def _finished(
     trace: list[dict[str, Any]] | None = None,
 ) -> GameResult:
     if result == 0:
-        return GameResult(game_id, p0, p1, seed, result, "P0_WIN", p0, p1, "RESULT", actions, time.perf_counter() - started, trace=trace or [])
+        return GameResult(game_id, p0, p1, seed, result, "P0_WIN", p0, p1, "RESULT", actions, time.perf_counter() - started, trace=trace or [], p0_reward=1, p1_reward=-1)
     if result == 1:
-        return GameResult(game_id, p0, p1, seed, result, "P1_WIN", p1, p0, "RESULT", actions, time.perf_counter() - started, trace=trace or [])
-    return GameResult(game_id, p0, p1, seed, result, "DRAW", None, None, "RESULT", actions, time.perf_counter() - started, trace=trace or [])
+        return GameResult(game_id, p0, p1, seed, result, "P1_WIN", p1, p0, "RESULT", actions, time.perf_counter() - started, trace=trace or [], p0_reward=-1, p1_reward=1)
+    return GameResult(game_id, p0, p1, seed, result, "DRAW", None, None, "RESULT", actions, time.perf_counter() - started, trace=trace or [], p0_reward=0, p1_reward=0)
+
+
+def _agent_failure(
+    config: EvalConfig,
+    game_id: str,
+    p0: str,
+    p1: str,
+    seed: int,
+    bad_seat: int,
+    reason: str,
+    status: str,
+    actions: int,
+    started: float,
+    error: str,
+    trace: list[dict[str, Any]] | None = None,
+    initial: bool = False,
+) -> GameResult:
+    if config.profile != "kaggle":
+        return _forfeit(game_id, p0, p1, seed, bad_seat, reason, actions, started, error, trace)
+
+    statuses = ["DONE", "DONE"]
+    statuses[bad_seat] = status
+    if initial:
+        return GameResult(
+            game_id=game_id,
+            p0=p0,
+            p1=p1,
+            seed=seed,
+            result=None,
+            outcome="NO_RESULT",
+            winner=None,
+            loser=p0 if bad_seat == 0 else p1,
+            reason=reason,
+            actions=actions,
+            duration_s=time.perf_counter() - started,
+            error=error,
+            trace=trace or [],
+            p0_status=statuses[0],
+            p1_status=statuses[1],
+            failure_class="AGENT_FAILURE",
+        )
+
+    rewards: list[float | None] = [1, 1]
+    rewards[bad_seat] = None
+    winner = p1 if bad_seat == 0 else p0
+    loser = p0 if bad_seat == 0 else p1
+    return GameResult(
+        game_id=game_id,
+        p0=p0,
+        p1=p1,
+        seed=seed,
+        result=1 if bad_seat == 0 else 0,
+        outcome="P0_LOSS" if bad_seat == 0 else "P1_LOSS",
+        winner=winner,
+        loser=loser,
+        reason=reason,
+        actions=actions,
+        duration_s=time.perf_counter() - started,
+        error=error,
+        trace=trace or [],
+        p0_status=statuses[0],
+        p1_status=statuses[1],
+        p0_reward=rewards[0],
+        p1_reward=rewards[1],
+        failure_class="AGENT_FAILURE",
+    )
 
 
 def _forfeit(
@@ -481,6 +618,12 @@ def _selected_options(obs: dict[str, Any], action: list[int]) -> list[dict[str, 
     return [_summarize_option(options[index]) for index in action if 0 <= index < len(options)]
 
 
+def _selected_options_safe(obs: dict[str, Any], action: list[Any]) -> list[dict[str, Any]]:
+    if not all(type(index) is int for index in action):
+        return []
+    return _selected_options(obs, action)
+
+
 def _write_trace(path: Path, event: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
@@ -518,6 +661,8 @@ def _should_keep_trace(result: GameResult, config: EvalConfig) -> bool:
         if result.reason != "RESULT" or result.outcome == "NO_RESULT":
             return True
         return _sample_trace_selected(result.game_id, result.seed, config.record_sample_rate)
+    if mode == "training":
+        return not focus or focus in {result.p0, result.p1}
     return True
 
 
@@ -527,6 +672,8 @@ def _should_record_before_game(game_id: str, seed: int, config: EvalConfig) -> b
         return False
     if mode == "sample":
         return _sample_trace_selected(game_id, seed, config.record_sample_rate)
+    if mode == "training":
+        return True
     return True
 
 

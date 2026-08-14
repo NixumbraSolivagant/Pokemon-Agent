@@ -14,6 +14,7 @@ from pathlib import Path
 
 from . import __version__
 from .archive import sha256_file
+from .kaggle_spec import CABT_CONFIGURATION, CABT_SPEC_VERSION, KAGGLE_ENVIRONMENT_VERSION, cg_hash_report
 from .models import AgentStats, EvalConfig, GameResult, MatchReport, SubmissionInfo
 from .rating import KaggleStyleRating
 from .referee import play_game
@@ -139,6 +140,7 @@ def _run_indexed_schedule(
             mu=config.trueskill_mu,
             sigma=config.trueskill_sigma,
             kaggle_score_estimate=config.trueskill_mu - 3.0 * config.trueskill_sigma,
+            local_trueskill_score=config.trueskill_mu - 3.0 * config.trueskill_sigma,
         )
         for name in names
     }
@@ -156,7 +158,8 @@ def _run_indexed_schedule(
             for local_idx in range(games_per_pair):
                 swap = local_idx % 2 == 1
                 p0_name, p1_name = (name_b, name_a) if swap else (name_a, name_b)
-                yield game_no, p0_name, p1_name, config.seed + game_no, f"g{game_no:06d}"
+                seed_offset = local_idx if config.common_random_seeds else game_no
+                yield game_no, p0_name, p1_name, config.seed + seed_offset, f"g{game_no:06d}"
                 game_no += 1
     _progress(
         config,
@@ -236,6 +239,7 @@ def _run_indexed_schedule(
             stats[name].mu = ratings[name].mu
             stats[name].sigma = ratings[name].sigma
             stats[name].kaggle_score_estimate = ratings[name].kaggle_score_estimate
+            stats[name].local_trueskill_score = ratings[name].kaggle_score_estimate
 
     standings = sorted(
         stats.values(),
@@ -307,6 +311,11 @@ def _metadata(project_root: str | Path) -> dict[str, object]:
         "platform": platform.platform(),
         "project_root": str(Path(project_root).resolve()),
         "score_formula": "mu - 3*sigma",
+        "official_environment_version": KAGGLE_ENVIRONMENT_VERSION,
+        "official_spec_version": CABT_SPEC_VERSION,
+        "official_configuration": CABT_CONFIGURATION,
+        "cg_hashes": cg_hash_report(project_root),
+        "engine_seed_control": False,
         "score_field_alias": {
             "kaggle_score_estimate": "local_trueskill_score",
         },
@@ -322,6 +331,10 @@ def _metadata(project_root: str | Path) -> dict[str, object]:
 def _apply_stats(stats: dict[str, AgentStats], result: GameResult) -> None:
     p0 = stats[result.p0]
     p1 = stats[result.p1]
+    if not result.ranking_eligible:
+        p0.no_results += 1
+        p1.no_results += 1
+        return
     p0.games += 1
     p1.games += 1
     _ensure_opp(p0, result.p1)
@@ -341,7 +354,7 @@ def _apply_stats(stats: dict[str, AgentStats], result: GameResult) -> None:
         loser.opponents[result.winner]["losses"] += 1
         if result.reason == "TIMEOUT":
             loser.timeouts += 1
-        elif result.reason == "INVALID_ACTION" or result.reason == "ENGINE_REJECTED_ACTION":
+        elif result.reason in {"INVALID_ACTION", "ENGINE_REJECTED_ACTION", "ENGINE_DECK_ERROR"}:
             loser.invalids += 1
         elif result.reason != "RESULT":
             loser.crashes += 1
@@ -388,6 +401,11 @@ def save_report(report: MatchReport, out_dir: str | Path) -> None:
             fields = [
                 "name",
                 "kaggle_score_estimate",
+                "local_trueskill_score",
+                "kaggle_rank_score",
+                "predicted_public_score",
+                "prediction_interval",
+                "calibration_version",
                 "mu",
                 "sigma",
                 "games",

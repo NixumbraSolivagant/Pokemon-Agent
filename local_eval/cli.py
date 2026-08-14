@@ -11,6 +11,7 @@ from .models import EvalConfig, default_output_dir
 
 def _config_from_args(args: argparse.Namespace) -> EvalConfig:
     return EvalConfig(
+        profile=args.profile,
         act_timeout_s=args.act_timeout,
         import_timeout_s=args.import_timeout,
         deck_timeout_s=args.deck_timeout,
@@ -31,6 +32,7 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--profile", choices=("legacy", "kaggle"), default="kaggle")
     common.add_argument("--seed", type=int, default=20260717)
     common.add_argument("--import-timeout", type=float, default=6.0)
     common.add_argument("--deck-timeout", type=float, default=6.0)
@@ -40,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     common.add_argument("--max-actions", type=int, default=1000)
     common.add_argument("--out", type=Path, default=None)
     common.add_argument("--workers", type=int, default=1)
-    common.add_argument("--record-mode", choices=["all", "none", "losses", "sample"], default="losses")
+    common.add_argument("--record-mode", choices=["all", "none", "losses", "sample", "training"], default="losses")
     common.add_argument("--record-focus", default="")
     common.add_argument("--record-sample-rate", type=float, default=0.05)
     common.add_argument("--record-gzip", action="store_true")
