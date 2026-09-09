@@ -1,4 +1,5 @@
 # Pokémon TCG AI Agent
+![](https://github.com/NixumbraSolivagant/Pokemon-Agent/blob/master/2026-09-09_09-35.png)
 
 私有 champion/challenger 流程见 `docs/KAGGLE_GOLD_LOOP.md`；keidroid Ogerpon 前100搜索见 `docs/OGERPON_FRONT100_SEARCH.md`，教师初始化残差 Q、真实 CG belief search 与 CEM 闭环见 `docs/OGERPON_RESIDUAL_OPTIMIZATION.md`；排行榜回放大池见 `docs/OPPONENT_LEAGUE.md`；评估器一致性与排行榜校准见 `docs/KAGGLE_EVALUATOR_PARITY.md`；完整策略、牌组、提交类型和历史表现见 `docs/STRATEGY_PORTFOLIO.md`。竞争牌组、回放模型和提交状态默认保存在已忽略路径中。
 
